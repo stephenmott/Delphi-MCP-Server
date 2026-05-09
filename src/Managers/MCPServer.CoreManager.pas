@@ -89,8 +89,13 @@ begin
   
   var ResultJSON := TJSONObject.Create;
   try
-    ResultJSON.AddPair('protocolVersion', MCP_PROTOCOL_VERSION);
-    
+    //ResultJSON.AddPair('protocolVersion', MCP_PROTOCOL_VERSION);
+    var VerVal := Params.GetValue('protocolVersion');
+    if Assigned(VerVal) then
+      ResultJSON.AddPair('protocolVersion', VerVal.Value)
+    else
+      ResultJSON.AddPair('protocolVersion', MCP_PROTOCOL_VERSION);
+
     var Capabilities := TJSONObject.Create;
     ResultJSON.AddPair('capabilities', Capabilities);
     

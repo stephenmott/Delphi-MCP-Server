@@ -175,9 +175,15 @@ begin
       {$ENDIF}
 
       if FUseStdErr then
-        WriteLn(ErrOutput, LogLine)
+      begin
+        WriteLn(ErrOutput, LogLine);
+        Flush(ErrOutput);
+      end
       else
+      begin
         WriteLn(LogLine);
+        Flush(Output);
+      end;
 
       {$IFDEF MSWINDOWS}
       SetConsoleTextAttribute(ConsoleHandle, 7);

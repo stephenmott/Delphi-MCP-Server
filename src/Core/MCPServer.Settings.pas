@@ -22,6 +22,10 @@ type
     FSSLCertFile: string;
     FSSLKeyFile: string;
     FSSLRootCertFile: string;
+    FOAuthEnabled: Boolean;
+    FOAuthPassword: string;
+    FOAuthTokenSecret: string;
+    FOAuthTokenExpiry: Integer;
     function GetProtocol: string;
     
     procedure LoadDefaults;
@@ -46,6 +50,10 @@ type
     property SSLCertFile: string read FSSLCertFile write FSSLCertFile;
     property SSLKeyFile: string read FSSLKeyFile write FSSLKeyFile;
     property SSLRootCertFile: string read FSSLRootCertFile write FSSLRootCertFile;
+    property OAuthEnabled: Boolean read FOAuthEnabled write FOAuthEnabled;
+    property OAuthPassword: string read FOAuthPassword write FOAuthPassword;
+    property OAuthTokenSecret: string read FOAuthTokenSecret write FOAuthTokenSecret;
+    property OAuthTokenExpiry: Integer read FOAuthTokenExpiry write FOAuthTokenExpiry;
   end;
 
 implementation
@@ -93,6 +101,10 @@ begin
   FSSLCertFile := '';
   FSSLKeyFile := '';
   FSSLRootCertFile := '';
+  FOAuthEnabled := False;
+  FOAuthPassword := '';
+  FOAuthTokenSecret := '';
+  FOAuthTokenExpiry := 3600;
 end;
 
 function TMCPSettings.GetProtocol: string;
@@ -124,6 +136,15 @@ begin
     IniFile.WriteString('SSL', 'CertFile', FSSLCertFile);
     IniFile.WriteString('SSL', 'KeyFile', FSSLKeyFile);
     IniFile.WriteString('SSL', 'RootCertFile', FSSLRootCertFile);
+
+    IniFile.WriteString('OAuth', '; OAuth 2.0 authorization for remote MCP clients (e.g. Claude.ai)', '');
+    IniFile.WriteBool('OAuth', 'Enabled', FOAuthEnabled);
+    IniFile.WriteString('OAuth', '; Password shown on the browser authorization form', '');
+    IniFile.WriteString('OAuth', 'Password', FOAuthPassword);
+    IniFile.WriteString('OAuth', '; Secret used to sign JWT tokens - use a long random string', '');
+    IniFile.WriteString('OAuth', 'TokenSecret', FOAuthTokenSecret);
+    IniFile.WriteString('OAuth', '; Token lifetime in seconds (default 3600 = 1 hour)', '');
+    IniFile.WriteInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
   finally
     IniFile.Free;
   end;
@@ -149,7 +170,12 @@ begin
     FSSLCertFile := IniFile.ReadString('SSL', 'CertFile', FSSLCertFile);
     FSSLKeyFile := IniFile.ReadString('SSL', 'KeyFile', FSSLKeyFile);
     FSSLRootCertFile := IniFile.ReadString('SSL', 'RootCertFile', FSSLRootCertFile);
-    
+
+    FOAuthEnabled := IniFile.ReadBool('OAuth', 'Enabled', FOAuthEnabled);
+    FOAuthPassword := IniFile.ReadString('OAuth', 'Password', FOAuthPassword);
+    FOAuthTokenSecret := IniFile.ReadString('OAuth', 'TokenSecret', FOAuthTokenSecret);
+    FOAuthTokenExpiry := IniFile.ReadInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
+
     TLogger.Info('Settings loaded from: ' + FSettingsFile);
     TLogger.Info('Server: ' + Protocol + '://' + FHost + ':' + IntToStr(FPort));
     if FSSLEnabled then
@@ -175,14 +201,19 @@ begin
     IniFile.WriteString('Server', 'Name', FServerName);
     IniFile.WriteString('Server', 'Version', FServerVersion);
     IniFile.WriteString('Server', 'Endpoint', FEndpoint);
-    
+
     IniFile.WriteBool('CORS', 'Enabled', FCorsEnabled);
     IniFile.WriteString('CORS', 'AllowedOrigins', FCorsAllowedOrigins);
-    
+
     IniFile.WriteBool('SSL', 'Enabled', FSSLEnabled);
     IniFile.WriteString('SSL', 'CertFile', FSSLCertFile);
     IniFile.WriteString('SSL', 'KeyFile', FSSLKeyFile);
     IniFile.WriteString('SSL', 'RootCertFile', FSSLRootCertFile);
+
+    IniFile.WriteBool('OAuth', 'Enabled', FOAuthEnabled);
+    IniFile.WriteString('OAuth', 'Password', FOAuthPassword);
+    IniFile.WriteString('OAuth', 'TokenSecret', FOAuthTokenSecret);
+    IniFile.WriteInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
   finally
     IniFile.Free;
   end;
