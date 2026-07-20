@@ -5,6 +5,7 @@ interface
 uses
   System.SysUtils,
   System.Classes,
+  System.JSON,
   MCPServer.Types,
   MCPServer.JsonRpcProcessor,
   MCPServer.Logger;
@@ -40,11 +41,16 @@ begin
 end;
 
 procedure TMCPStdioTransport.Run;
+var
+  ErrorJson: TJSONObject;
+  ErrorObj: TJSONObject;
+  InputLine: string;
+  Response: string;
 begin
   TLogger.Info('STDIO transport started - reading from stdin, writing to stdout');
   TLogger.Info('Logging to stderr');
 
-  var InputLine := '';
+  InputLine := '';
   while not Eof(Input) do
   begin
     try
@@ -55,7 +61,7 @@ begin
 
       TLogger.Info('Received: ' + InputLine);
 
-      var Response := FJsonRpcProcessor.ProcessRequest(InputLine, '');
+      Response := FJsonRpcProcessor.ProcessRequest(InputLine, '');
 
       if Response <> '' then
       begin
@@ -69,9 +75,21 @@ begin
       begin
         TLogger.Error('Error processing STDIO request: ' + E.Message);
 
-        var ErrorResponse := '{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"' +
-                             E.Message.Replace('"', '\"') + '"}}';
-        Writeln(Output, ErrorResponse);
+        // Build the error response with the JSON writer: hand-concatenated
+        // JSON with only '"' replaced emits invalid JSON whenever the message
+        // contains a backslash (e.g. a Windows path) or a control character.
+        ErrorJson := TJSONObject.Create;
+        try
+          ErrorJson.AddPair('jsonrpc', '2.0');
+          ErrorJson.AddPair('id', TJSONNull.Create);
+          ErrorObj := TJSONObject.Create;
+          ErrorJson.AddPair('error', ErrorObj);
+          ErrorObj.AddPair('code', TJSONNumber.Create(JSONRPC_INTERNAL_ERROR));
+          ErrorObj.AddPair('message', E.Message);
+          Writeln(Output, ErrorJson.ToJSON);
+        finally
+          ErrorJson.Free;
+        end;
         Flush(Output);
       end;
     end;
