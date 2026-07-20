@@ -4,7 +4,7 @@ interface
 
 // TaurusTLS provides OpenSSL 3.x support with modern ECDHE cipher suites
 // Install via GetIt Package Manager: Search for "TaurusTLS" or get from https://github.com/JPeterMugaas/TaurusTLS
-{.$DEFINE USE_TAURUS_TLS}  // Comment this line to use standard Indy SSL (OpenSSL 1.0.2)
+{$DEFINE USE_TAURUS_TLS}  // Comment this line to use standard Indy SSL (OpenSSL 1.0.2)
 
 uses
   System.SysUtils,
@@ -37,6 +37,11 @@ type
     ExpiresAt: TDateTime;
   end;
 
+  TRefreshTokenEntry = record
+    IssuedAt:  TDateTime;
+    ExpiresAt: TDateTime;
+  end;
+
   TMCPIdHTTPServer = class(TComponent)
   private
     FHTTPServer: TIdHTTPServer;
@@ -54,6 +59,8 @@ type
     FEventIDCounter: Int64;
     FAuthCodes: TDictionary<string, TAuthCodeEntry>;
     FAuthCodesLock: TCriticalSection;
+    FRefreshTokens: TDictionary<string, TRefreshTokenEntry>;
+    FRefreshTokensLock: TCriticalSection;
     procedure ConfigureSSL;
     procedure HandleQuerySSLPort(APort: Word; var VUseSSL: Boolean);
     procedure HandleHTTPRequest(Context: TIdContext; RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
@@ -73,6 +80,11 @@ type
     function GetRequestBaseURL(RequestInfo: TIdHTTPRequestInfo): string;
     function GenerateAuthCode: string;
     procedure CleanExpiredAuthCodes;
+    function GenerateRefreshToken: string;
+    procedure CleanExpiredRefreshTokens;
+    function GetRefreshTokensFilePath: string;
+    procedure SaveRefreshTokens;
+    procedure LoadRefreshTokens;
     function GenerateJWT: string;
     function ValidateBearerToken(const Token: string): Boolean;
     function HTMLEncode(const S: string): string;
@@ -179,6 +191,8 @@ begin
   FJsonRpcProcessor := nil;
   FAuthCodes := TDictionary<string, TAuthCodeEntry>.Create;
   FAuthCodesLock := TCriticalSection.Create;
+  FRefreshTokens := TDictionary<string, TRefreshTokenEntry>.Create;
+  FRefreshTokensLock := TCriticalSection.Create;
 
   FHTTPServer := TIdHTTPServer.Create(Self);
   FHTTPServer.KeepAlive := True;
@@ -198,6 +212,10 @@ begin
   FJsonRpcProcessor.Free;
   FAuthCodes.Free;
   FAuthCodesLock.Free;
+  if Assigned(FRefreshTokens) then
+    SaveRefreshTokens;
+  FRefreshTokens.Free;
+  FRefreshTokensLock.Free;
   inherited;
 end;
 
@@ -218,6 +236,9 @@ begin
     if FSettings.SSLEnabled then
       ConfigureSSL;
   end;
+
+  if Assigned(FSettings) and FSettings.OAuthEnabled then
+    LoadRefreshTokens;
 
   FHTTPServer.DefaultPort := FPort;
   FHTTPServer.Active := True;
@@ -350,8 +371,15 @@ begin
       begin
         ResponseInfo.ResponseNo := HTTP_UNAUTHORIZED;
         ResponseInfo.ResponseText := 'Unauthorized';
+        // RFC 9728 / MCP 2025-06-18: the 401 MUST point the client at the
+        // protected-resource metadata so it can discover the authorization
+        // server. Newer MCP clients (e.g. Claude Desktop) require the
+        // resource_metadata parameter here and no longer fall back to probing
+        // .well-known paths — without it OAuth discovery never starts and the
+        // login page is never shown.
         ResponseInfo.CustomHeaders.Values['WWW-Authenticate'] :=
-          'Bearer realm="' + GetRequestBaseURL(RequestInfo) + '"';
+          Format('Bearer realm="%0:s", resource_metadata="%0:s%1:s%2:s"',
+            [GetRequestBaseURL(RequestInfo), OAUTH_PROTECTED_RESOURCE, FSettings.Endpoint]);
         ResponseInfo.ContentType := 'application/json';
         ResponseInfo.ContentText := '{"error":"invalid_token"}';
         TLogger.Warning('Rejected unauthenticated MCP request from: ' + RequestInfo.RemoteIP);
@@ -898,6 +926,7 @@ begin
 
     var GrantTypes := TJSONArray.Create;
     GrantTypes.Add('authorization_code');
+    GrantTypes.Add('refresh_token');
     Meta.AddPair('grant_types_supported', GrantTypes);
 
     var ChallengeMethods := TJSONArray.Create;
@@ -1103,10 +1132,13 @@ procedure TMCPIdHTTPServer.HandleToken(RequestInfo: TIdHTTPRequestInfo;
 var
   Body: string;
   Params: TDictionary<string, string>;
-  Code, CodeVerifier, GrantType: string;
-  Entry: TAuthCodeEntry;
+  Code, CodeVerifier, GrantType, OldRefreshToken: string;
+  AuthEntry: TAuthCodeEntry;
+  RefreshEntry: TRefreshTokenEntry;
   ComputedChallenge: string;
   TokenJSON: TJSONObject;
+  NewRefreshToken: string;
+  RefreshFound: Boolean;
 begin
   // Token endpoint always allows any origin so clients can call it cross-origin
   ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
@@ -1126,69 +1158,293 @@ begin
 
   Params := ParseFormParams(Body);
   try
-    GrantType   := GetParam(Params, 'grant_type');
-    Code        := GetParam(Params, 'code');
-    CodeVerifier := GetParam(Params, 'code_verifier');
+    GrantType       := GetParam(Params, 'grant_type');
+    Code            := GetParam(Params, 'code');
+    CodeVerifier    := GetParam(Params, 'code_verifier');
+    OldRefreshToken := GetParam(Params, 'refresh_token');
   finally
     Params.Free;
   end;
 
-  if GrantType <> 'authorization_code' then
+  TLogger.Info(Format('OAuth /token request: grant_type=%s, code len=%d, verifier len=%d, refresh_token len=%d',
+    [GrantType, Length(Code), Length(CodeVerifier), Length(OldRefreshToken)]));
+
+  if GrantType = 'authorization_code' then
   begin
+    // Validate auth code and PKCE
+    FAuthCodesLock.Enter;
+    try
+      if not FAuthCodes.TryGetValue(Code, AuthEntry) then
+      begin
+        TLogger.Warning('OAuth /token: REJECTED - auth code not found in store ' +
+          Format('(received code len=%d, %d code(s) currently stored)', [Length(Code), FAuthCodes.Count]));
+        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
+        ResponseInfo.ContentType := 'application/json';
+        ResponseInfo.ContentText := '{"error":"invalid_grant"}';
+        Exit;
+      end;
+
+      if Now > AuthEntry.ExpiresAt then
+      begin
+        TLogger.Warning('OAuth /token: REJECTED - auth code expired');
+        FAuthCodes.Remove(Code);
+        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
+        ResponseInfo.ContentType := 'application/json';
+        ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"Code expired"}';
+        Exit;
+      end;
+
+      // Verify PKCE: BASE64URL(SHA256(code_verifier)) must equal the stored code_challenge
+      ComputedChallenge := Base64URLEncode(THashSHA2.GetHashBytes(CodeVerifier));
+
+      if ComputedChallenge <> AuthEntry.CodeChallenge then
+      begin
+        TLogger.Warning(Format('OAuth /token: REJECTED - PKCE mismatch (computed=%s expected=%s)',
+          [ComputedChallenge, AuthEntry.CodeChallenge]));
+        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
+        ResponseInfo.ContentType := 'application/json';
+        ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"PKCE verification failed"}';
+        Exit;
+      end;
+
+      FAuthCodes.Remove(Code); // one-time use
+    finally
+      FAuthCodesLock.Leave;
+    end;
+
+    // Issue refresh token alongside access token
+    NewRefreshToken        := GenerateRefreshToken;
+    RefreshEntry.IssuedAt  := Now;
+    RefreshEntry.ExpiresAt := Now + FSettings.OAuthRefreshTokenExpiry * (1.0 / 86400.0);
+
+    FRefreshTokensLock.Enter;
+    try
+      CleanExpiredRefreshTokens;
+      FRefreshTokens.AddOrSetValue(NewRefreshToken, RefreshEntry);
+    finally
+      FRefreshTokensLock.Leave;
+    end;
+    SaveRefreshTokens;
+
+    TokenJSON := TJSONObject.Create;
+    try
+      TokenJSON.AddPair('access_token',  GenerateJWT);
+      TokenJSON.AddPair('token_type',    'bearer');
+      TokenJSON.AddPair('expires_in',    TJSONNumber.Create(FSettings.OAuthTokenExpiry));
+      TokenJSON.AddPair('refresh_token', NewRefreshToken);
+
+      ResponseInfo.ContentType := 'application/json';
+      ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
+      ResponseInfo.ContentText := TokenJSON.ToJSON;
+      ResponseInfo.ResponseNo  := HTTP_OK;
+      TLogger.Info('OAuth: issued access token and refresh token');
+    finally
+      TokenJSON.Free;
+    end;
+  end
+  else if GrantType = 'refresh_token' then
+  begin
+    // Validate incoming refresh token — consume it immediately (rotation)
+    RefreshFound := False;
+
+    FRefreshTokensLock.Enter;
+    try
+      if FRefreshTokens.TryGetValue(OldRefreshToken, RefreshEntry) then
+      begin
+        FRefreshTokens.Remove(OldRefreshToken); // consume regardless — rotation or expired
+        RefreshFound := Now <= RefreshEntry.ExpiresAt;
+      end;
+    finally
+      FRefreshTokensLock.Leave;
+    end;
+
+    if not RefreshFound then
+    begin
+      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
+      ResponseInfo.ContentType := 'application/json';
+      ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"Invalid or expired refresh token"}';
+      TLogger.Warning('OAuth: rejected invalid/expired refresh token from: ' + RequestInfo.RemoteIP);
+      Exit;
+    end;
+
+    // Issue new access token and rotated refresh token
+    NewRefreshToken        := GenerateRefreshToken;
+    RefreshEntry.IssuedAt  := Now;
+    RefreshEntry.ExpiresAt := Now + FSettings.OAuthRefreshTokenExpiry * (1.0 / 86400.0);
+
+    FRefreshTokensLock.Enter;
+    try
+      CleanExpiredRefreshTokens;
+      FRefreshTokens.AddOrSetValue(NewRefreshToken, RefreshEntry);
+    finally
+      FRefreshTokensLock.Leave;
+    end;
+    SaveRefreshTokens;
+
+    TokenJSON := TJSONObject.Create;
+    try
+      TokenJSON.AddPair('access_token',  GenerateJWT);
+      TokenJSON.AddPair('token_type',    'bearer');
+      TokenJSON.AddPair('expires_in',    TJSONNumber.Create(FSettings.OAuthTokenExpiry));
+      TokenJSON.AddPair('refresh_token', NewRefreshToken);
+
+      ResponseInfo.ContentType := 'application/json';
+      ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
+      ResponseInfo.ContentText := TokenJSON.ToJSON;
+      ResponseInfo.ResponseNo  := HTTP_OK;
+      TLogger.Info('OAuth: refreshed access token (rotated refresh token)');
+    finally
+      TokenJSON.Free;
+    end;
+  end
+  else
+  begin
+    TLogger.Warning('OAuth /token: REJECTED - unsupported grant_type "' + GrantType + '"');
     ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
     ResponseInfo.ContentType := 'application/json';
     ResponseInfo.ContentText := '{"error":"unsupported_grant_type"}';
+  end;
+end;
+
+// ── Refresh token helpers ────────────────────────────────────────────────────
+
+function TMCPIdHTTPServer.GenerateRefreshToken: string;
+var
+  G1, G2: TGUID;
+begin
+  // Two GUIDs concatenated = 256 bits of randomness
+  CreateGUID(G1);
+  CreateGUID(G2);
+  Result := (GUIDToString(G1) + GUIDToString(G2))
+    .Replace('{', '', [rfReplaceAll])
+    .Replace('}', '', [rfReplaceAll])
+    .Replace('-', '', [rfReplaceAll])
+    .ToLower;
+end;
+
+procedure TMCPIdHTTPServer.CleanExpiredRefreshTokens;
+var
+  Expired: TList<string>;
+begin
+  // Caller must hold FRefreshTokensLock
+  Expired := TList<string>.Create;
+  try
+    for var Pair in FRefreshTokens do
+      if Now > Pair.Value.ExpiresAt then
+        Expired.Add(Pair.Key);
+    for var Key in Expired do
+      FRefreshTokens.Remove(Key);
+  finally
+    Expired.Free;
+  end;
+end;
+
+function TMCPIdHTTPServer.GetRefreshTokensFilePath: string;
+begin
+  if Assigned(FSettings) then
+    Result := TPath.Combine(TPath.GetDirectoryName(FSettings.SettingsFile), 'refresh_tokens.json')
+  else
+    Result := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)), 'refresh_tokens.json');
+end;
+
+procedure TMCPIdHTTPServer.SaveRefreshTokens;
+var
+  Wrapper: TJSONObject;
+  TokensArr: TJSONArray;
+  TokenEntry: TJSONObject;
+  FilePath: string;
+begin
+  FilePath  := GetRefreshTokensFilePath;
+  Wrapper   := TJSONObject.Create;
+  TokensArr := TJSONArray.Create;
+  try
+    Wrapper.AddPair('refresh_tokens', TokensArr); // Wrapper takes ownership
+
+    FRefreshTokensLock.Enter;
+    try
+      CleanExpiredRefreshTokens;
+      for var Pair in FRefreshTokens do
+      begin
+        TokenEntry := TJSONObject.Create;
+        TokenEntry.AddPair('token',      Pair.Key);
+        TokenEntry.AddPair('issued_at',  TJSONNumber.Create(
+          DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Pair.Value.IssuedAt))));
+        TokenEntry.AddPair('expires_at', TJSONNumber.Create(
+          DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Pair.Value.ExpiresAt))));
+        TokensArr.AddElement(TokenEntry);
+      end;
+    finally
+      FRefreshTokensLock.Leave;
+    end;
+
+    TFile.WriteAllText(FilePath, Wrapper.ToJSON, TEncoding.UTF8);
+    TLogger.Info(Format('OAuth: saved %d refresh token(s)', [TokensArr.Count]));
+  finally
+    Wrapper.Free; // also frees TokensArr and all entries
+  end;
+end;
+
+procedure TMCPIdHTTPServer.LoadRefreshTokens;
+var
+  FilePath, JSON: string;
+  Root: TJSONObject;
+  TokensArr: TJSONArray;
+  Item: TJSONObject;
+  Entry: TRefreshTokenEntry;
+  TokenVal, IssuedVal, ExpiresVal: TJSONValue;
+  Loaded: Integer;
+begin
+  FilePath := GetRefreshTokensFilePath;
+  if not TFile.Exists(FilePath) then
     Exit;
-  end;
 
-  FAuthCodesLock.Enter;
   try
-    if not FAuthCodes.TryGetValue(Code, Entry) then
-    begin
-      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.ContentText := '{"error":"invalid_grant"}';
+    JSON := TFile.ReadAllText(FilePath, TEncoding.UTF8);
+    Root := TJSONObject.ParseJSONValue(JSON) as TJSONObject;
+    if not Assigned(Root) then
       Exit;
+    try
+      TokensArr := Root.GetValue('refresh_tokens') as TJSONArray;
+      if not Assigned(TokensArr) then
+        Exit;
+
+      Loaded := 0;
+      FRefreshTokensLock.Enter;
+      try
+        for var I := 0 to TokensArr.Count - 1 do
+        begin
+          Item := TokensArr.Items[I] as TJSONObject;
+          if not Assigned(Item) then
+            Continue;
+
+          TokenVal   := Item.GetValue('token');
+          IssuedVal  := Item.GetValue('issued_at');
+          ExpiresVal := Item.GetValue('expires_at');
+          if not Assigned(TokenVal) or not Assigned(IssuedVal) or not Assigned(ExpiresVal) then
+            Continue;
+
+          Entry.IssuedAt  := TTimeZone.Local.ToLocalTime(
+            UnixToDateTime(StrToInt64(IssuedVal.Value)));
+          Entry.ExpiresAt := TTimeZone.Local.ToLocalTime(
+            UnixToDateTime(StrToInt64(ExpiresVal.Value)));
+
+          if Now < Entry.ExpiresAt then
+          begin
+            FRefreshTokens.AddOrSetValue(TokenVal.Value, Entry);
+            Inc(Loaded);
+          end;
+        end;
+      finally
+        FRefreshTokensLock.Leave;
+      end;
+
+      TLogger.Info(Format('OAuth: loaded %d refresh token(s) from %s', [Loaded, FilePath]));
+    finally
+      Root.Free;
     end;
-
-    if Now > Entry.ExpiresAt then
-    begin
-      FAuthCodes.Remove(Code);
-      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"Code expired"}';
-      Exit;
-    end;
-
-    // Verify PKCE: BASE64URL(SHA256(code_verifier)) must equal the stored code_challenge
-    ComputedChallenge := Base64URLEncode(THashSHA2.GetHashBytes(CodeVerifier));
-
-    if ComputedChallenge <> Entry.CodeChallenge then
-    begin
-      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"PKCE verification failed"}';
-      Exit;
-    end;
-
-    FAuthCodes.Remove(Code); // one-time use
-  finally
-    FAuthCodesLock.Leave;
-  end;
-
-  TokenJSON := TJSONObject.Create;
-  try
-    TokenJSON.AddPair('access_token', GenerateJWT);
-    TokenJSON.AddPair('token_type',   'bearer');
-    TokenJSON.AddPair('expires_in',   TJSONNumber.Create(FSettings.OAuthTokenExpiry));
-
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
-    ResponseInfo.ContentText := TokenJSON.ToJSON;
-    ResponseInfo.ResponseNo  := HTTP_OK;
-    TLogger.Info('OAuth: issued access token');
-  finally
-    TokenJSON.Free;
+  except
+    on E: Exception do
+      TLogger.Warning('OAuth: failed to load refresh tokens: ' + E.Message);
   end;
 end;
 

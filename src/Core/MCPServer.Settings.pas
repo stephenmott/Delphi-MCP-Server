@@ -26,6 +26,7 @@ type
     FOAuthPassword: string;
     FOAuthTokenSecret: string;
     FOAuthTokenExpiry: Integer;
+    FOAuthRefreshTokenExpiry: Integer;
     function GetProtocol: string;
     
     procedure LoadDefaults;
@@ -54,6 +55,7 @@ type
     property OAuthPassword: string read FOAuthPassword write FOAuthPassword;
     property OAuthTokenSecret: string read FOAuthTokenSecret write FOAuthTokenSecret;
     property OAuthTokenExpiry: Integer read FOAuthTokenExpiry write FOAuthTokenExpiry;
+    property OAuthRefreshTokenExpiry: Integer read FOAuthRefreshTokenExpiry write FOAuthRefreshTokenExpiry;
   end;
 
 implementation
@@ -105,6 +107,7 @@ begin
   FOAuthPassword := '';
   FOAuthTokenSecret := '';
   FOAuthTokenExpiry := 3600;
+  FOAuthRefreshTokenExpiry := 2592000; // 30 days
 end;
 
 function TMCPSettings.GetProtocol: string;
@@ -143,8 +146,10 @@ begin
     IniFile.WriteString('OAuth', 'Password', FOAuthPassword);
     IniFile.WriteString('OAuth', '; Secret used to sign JWT tokens - use a long random string', '');
     IniFile.WriteString('OAuth', 'TokenSecret', FOAuthTokenSecret);
-    IniFile.WriteString('OAuth', '; Token lifetime in seconds (default 3600 = 1 hour)', '');
+    IniFile.WriteString('OAuth', '; Access token lifetime in seconds (default 3600 = 1 hour)', '');
     IniFile.WriteInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
+    IniFile.WriteString('OAuth', '; Refresh token lifetime in seconds (default 2592000 = 30 days)', '');
+    IniFile.WriteInteger('OAuth', 'RefreshTokenExpiry', FOAuthRefreshTokenExpiry);
   finally
     IniFile.Free;
   end;
@@ -175,6 +180,7 @@ begin
     FOAuthPassword := IniFile.ReadString('OAuth', 'Password', FOAuthPassword);
     FOAuthTokenSecret := IniFile.ReadString('OAuth', 'TokenSecret', FOAuthTokenSecret);
     FOAuthTokenExpiry := IniFile.ReadInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
+    FOAuthRefreshTokenExpiry := IniFile.ReadInteger('OAuth', 'RefreshTokenExpiry', FOAuthRefreshTokenExpiry);
 
     TLogger.Info('Settings loaded from: ' + FSettingsFile);
     TLogger.Info('Server: ' + Protocol + '://' + FHost + ':' + IntToStr(FPort));
@@ -214,6 +220,7 @@ begin
     IniFile.WriteString('OAuth', 'Password', FOAuthPassword);
     IniFile.WriteString('OAuth', 'TokenSecret', FOAuthTokenSecret);
     IniFile.WriteInteger('OAuth', 'TokenExpiry', FOAuthTokenExpiry);
+    IniFile.WriteInteger('OAuth', 'RefreshTokenExpiry', FOAuthRefreshTokenExpiry);
   finally
     IniFile.Free;
   end;
