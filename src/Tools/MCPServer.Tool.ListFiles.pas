@@ -19,7 +19,7 @@ type
   public
     [SchemaDescription('Directory path to list files from')]
     property Path: string read FPath write FPath;
-    
+
     [Optional]
     [SchemaDescription('Include hidden files in the listing')]
     property IncludeHidden: Boolean read FIncludeHidden write FIncludeHidden;
@@ -35,14 +35,19 @@ type
 implementation
 
 uses
-  MCPServer.Registration;
+  MCPServer.Registration,
+  MCPServer.PathBoundary;
+
+const
+  TOOL_NAME = 'list_files';
+
 
 { TListFilesTool }
 
 constructor TListFilesTool.Create;
 begin
   inherited;
-  FName := 'list_files';
+  FName := TOOL_NAME;
   FDescription := 'List files in a directory';
 end;
 
@@ -62,12 +67,13 @@ begin
     NormalizedPath := TPath.GetFullPath(Params.Path);
     AllowedBasePath := TPath.GetFullPath(GetCurrentDir);
 
-    if not NormalizedPath.StartsWith(AllowedBasePath, True) then
+    const IsAllowed = TPathBoundary.IsWithin(NormalizedPath, AllowedBasePath);
+    if not IsAllowed then
     begin
       Result := 'Error: Access denied - path outside allowed directory';
       Exit;
     end;
-    
+
     if TDirectory.Exists(NormalizedPath) then
     begin
       FileArray := TDirectory.GetFiles(NormalizedPath);
@@ -83,7 +89,7 @@ begin
           {$WARN SYMBOL_PLATFORM ON}
         end;
         {$ENDIF}
-          
+
         Files.Add(ExtractFileName(FileName));
       end;
       Result := 'Files in ' + NormalizedPath + ':' + sLineBreak + Files.Text;
@@ -96,7 +102,7 @@ begin
 end;
 
 initialization
-  TMCPRegistry.RegisterTool('list_files',
+  TMCPRegistry.RegisterTool(TOOL_NAME,
     function: IMCPTool
     begin
       Result := TListFilesTool.Create;

@@ -2,9 +2,7 @@ unit MCPServer.IdHTTPServer;
 
 interface
 
-// TaurusTLS provides OpenSSL 3.x/4.x support with modern ECDHE cipher suites
-// Install via GetIt Package Manager: Search for "TaurusTLS" or get from https://github.com/TaurusTLS-Developers/TaurusTLS
-{.$DEFINE USE_TAURUS_TLS}  // Comment this line to use standard Indy SSL (OpenSSL 1.0.2)
+{$I MCPServer.inc}
 
 uses
   System.SysUtils,
@@ -12,13 +10,15 @@ uses
   System.JSON,
   System.Rtti,
   System.IOUtils,
-  System.SyncObjs,
   System.Generics.Collections,
   IdHTTPServer,
   IdContext,
   IdCustomHTTPServer,
+  IdHeaderList,
   IdGlobal,
   IdGlobalProtocols,
+  IdSocketHandle,
+  IdStack,
   {$IFDEF USE_TAURUS_TLS}
   TaurusTLS,
   {$ELSE}
@@ -27,19 +27,15 @@ uses
   IdServerIOHandler,
   MCPServer.Types,
   MCPServer.Settings,
+  MCPServer.Authorization,
+  MCPServer.OAuthServer,
+  MCPServer.RequestContext,
   MCPServer.JsonRpcProcessor;
 
 type
-  TAuthCodeEntry = record
-    CodeChallenge: string;
-    RedirectURI: string;
-    State: string;
-    ExpiresAt: TDateTime;
-  end;
-
-  TRefreshTokenEntry = record
-    IssuedAt:  TDateTime;
-    ExpiresAt: TDateTime;
+  TMCPDiscardedBody = class(TMemoryStream)
+  public
+    function Write(const Buffer; Count: Longint): Longint; override;
   end;
 
   TMCPIdHTTPServer = class(TComponent)
@@ -56,129 +52,121 @@ type
     FPort: Word;
     FActive: Boolean;
     FSettings: TMCPSettings;
-    FEventIDCounter: Int64;
-    FAuthCodes: TDictionary<string, TAuthCodeEntry>;
-    FAuthCodesLock: TCriticalSection;
-    FRefreshTokens: TDictionary<string, TRefreshTokenEntry>;
-    FRefreshTokensLock: TCriticalSection;
+    FAuthorizer: IMCPAuthorizer;
+    // Built-in authorization server ([OAuth] Enabled=1); see MCPServer.OAuthServer.
+    FOAuthServer: TMCPOAuthServer;
     procedure ConfigureSSL;
+    procedure ConfigureBindings;
+    procedure AddBinding(const IP: string; IPVersion: TIdIPVersion);
+    procedure AddDualStackBindings(const IPv4Address, IPv6Address: string);
+    function ClaimEphemeralPort(const IP: string): Word;
     procedure HandleQuerySSLPort(APort: Word; var VUseSSL: Boolean);
+    procedure HandleParseAuthentication(Context: TIdContext; const AuthType, AuthData: string;
+      var VUsername, VPassword: string; var VHandled: Boolean);
     procedure HandleHTTPRequest(Context: TIdContext; RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    function VerifyAndSetCORSHeaders(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo): Boolean;
-    procedure HandleOptionsRequest(ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandleGetRequest(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandlePostRequest(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandlePostRequestSSE(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo; const RequestBody: string; const SessionID: string);
-    procedure HandlePostRequestJSON(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo; const RequestBody: string; const SessionID: string);
-    function GetNextEventID: string;
-    function AcceptsSSE(const AcceptHeader: string): Boolean;
-    function IsRequestOnlyNotificationsOrResponses(JSONRequest: TJSONValue): Boolean;
-    // OAuth helpers
-    function Base64URLEncode(const Bytes: TBytes): string;
-    function Base64URLDecode(const S: string): TBytes;
-    function ParseFormParams(const Body: string): TDictionary<string, string>;
-    function GetRequestBaseURL(RequestInfo: TIdHTTPRequestInfo): string;
-    function GenerateAuthCode: string;
-    procedure CleanExpiredAuthCodes;
-    function GenerateRefreshToken: string;
-    procedure CleanExpiredRefreshTokens;
-    function GetRefreshTokensFilePath: string;
-    procedure SaveRefreshTokens;
-    procedure LoadRefreshTokens;
-    function GenerateJWT: string;
-    function ValidateBearerToken(const Token: string): Boolean;
-    function HTMLEncode(const S: string): string;
-    function GetParam(Params: TDictionary<string, string>; const Key: string): string;
-    // OAuth endpoint handlers
-    procedure HandleWellKnownOAuth(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandleProtectedResourceMetadata(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandleRegister(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandleAuthorize(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-    procedure HandleToken(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
+    function AllowedOrigins: TArray<string>;
+    function ValidateOrigin(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo): Boolean;
+    function ValidateHost(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo): Boolean;
+    procedure ApplyCorsHeaders(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
+    procedure HandleEndpointInfo(ResponseInfo: TIdHTTPResponseInfo);
+    function ConfiguredResourceUri: string;
+    function IsPublicResourceMetadataPath(const Document: string): Boolean;
+    function IsProtectedResourceMetadataPath(const Document: string): Boolean;
+    function ResourceUri: string;
+    function ResourceMetadataUrl: string;
+    procedure HandleProtectedResourceMetadata(ResponseInfo: TIdHTTPResponseInfo);
+    function TryAuthenticate(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+      out Principal: TMCPPrincipal): Boolean;
+    procedure SendChallenge(ResponseInfo: TIdHTTPResponseInfo; Status: Integer; const Challenge: TMCPAuthChallenge;
+      const Message: string);
+    procedure HandlePostRequest(Context: TIdContext; RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+      const Principal: TMCPPrincipal);
+    function BuildTransportHints(RequestInfo: TIdHTTPRequestInfo): TMCPTransportHints;
+    procedure EchoLegacySessionId(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
+    procedure SendEmpty(ResponseInfo: TIdHTTPResponseInfo; Status: Integer);
+    procedure SendJson(ResponseInfo: TIdHTTPResponseInfo; Status: Integer; const Body: string);
+    procedure SendSse(ResponseInfo: TIdHTTPResponseInfo; const Body: string);
+    procedure SendJsonRpcError(ResponseInfo: TIdHTTPResponseInfo; Status, Code: Integer; const Message: string);
+    procedure SendMethodNotAllowed(ResponseInfo: TIdHTTPResponseInfo);
+    function HeaderPresent(RequestInfo: TIdHTTPRequestInfo; const Name: string): Boolean;
+    procedure CloseSubscriptions;
+    function HeaderValue(RequestInfo: TIdHTTPRequestInfo; const Name: string): string;
+    function IsListedHeader(const List, Name: string): Boolean;
+    procedure HandleCreatePostStream(Context: TIdContext; Headers: TIdHeaderList; var VPostStream: TStream);
+    function MaxBodyBytes: Integer;
+    function MaxJsonDepth: Integer;
+    function IsBodyWithinLimits(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+      const Body: string): Boolean;
+    function ReadBody(RequestInfo: TIdHTTPRequestInfo): string;
+    procedure SendOutcome(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+      const Outcome: TMCPProcessResult; const AcceptsEventStream: Boolean);
   public
     constructor Create(Owner: TComponent); override;
     destructor Destroy; override;
     procedure Start;
     procedure Stop;
+    function BoundAddresses: TArray<string>;
+    function BoundPort: Word;
     property Port: Word read FPort write FPort;
     property Active: Boolean read FActive;
     property ManagerRegistry: IMCPManagerRegistry read FManagerRegistry write FManagerRegistry;
     property CoreManager: IMCPCapabilityManager read FCoreManager write FCoreManager;
     property Settings: TMCPSettings read FSettings write FSettings;
+    property Authorizer: IMCPAuthorizer read FAuthorizer write FAuthorizer;
   end;
 
 implementation
 
 uses
   MCPServer.Resource.Server,
-  MCPServer.CoreManager,
-  MCPServer.Logger,
-  System.Hash,
-  System.DateUtils,
-  System.NetEncoding,
-  IdURI;
+  MCPServer.Errors,
+  MCPServer.HttpHeaders,
+  MCPServer.HttpStream,
+  MCPServer.Logger;
 
 const
-  KEEP_ALIVE_TIMEOUT = 300;
+  HOST_LOCALHOST = 'localhost';
+  DEFAULT_ENDPOINT = '/mcp';
+  HEADER_ALLOW_ORIGIN = 'Access-Control-Allow-Origin';
+  MESSAGE_NO_CERTIFICATE = 'SSL certificate file not found: %s';
+  MESSAGE_NO_KEY = 'SSL key file not found: %s';
   DEFAULT_MCP_PORT = 3000;
 
-  // HTTP Status Codes
-  HTTP_OK = 200;
-  HTTP_FOUND = 302;
-  HTTP_ACCEPTED = 202;
   HTTP_NO_CONTENT = 204;
-  HTTP_BAD_REQUEST = 400;
   HTTP_UNAUTHORIZED = 401;
-  HTTP_NOT_FOUND = 404;
-  HTTP_METHOD_NOT_ALLOWED = 405;
-  HTTP_NOT_ACCEPTABLE = 406;
   HTTP_FORBIDDEN = 403;
+  HTTP_METHOD_NOT_ALLOWED = 405;
+  HTTP_PAYLOAD_TOO_LARGE = 413;
 
-  // CORS Max Age (24 hours in seconds)
+  SUBSCRIPTION_CLOSE_GRACE_MS = 1000;
+  SUBSCRIPTION_CLOSE_POLL_MS = 10;
+
   CORS_MAX_AGE = 86400;
+  CORS_ALLOW_METHODS = 'POST, OPTIONS';
+  CORS_ALLOW_HEADERS = 'Accept, Content-Type, Authorization, ' + MCP_HEADER_PROTOCOL_VERSION + ', ' +
+    MCP_HEADER_METHOD + ', ' + MCP_HEADER_NAME + ', ' + MCP_HEADER_SESSION_ID + ', Last-Event-ID';
+  CORS_EXPOSE_HEADERS = MCP_HEADER_SESSION_ID + ', WWW-Authenticate';
+  ALLOW_HEADER = 'POST, OPTIONS';
 
-  // Auth code lifetime: 10 minutes
-  AUTH_CODE_LIFETIME = 10 / (24 * 60);
+  HEADER_ORIGIN = 'Origin';
+  HEADER_AUTHORIZATION = 'Authorization';
+  HEADER_WWW_AUTHENTICATE = 'WWW-Authenticate';
+  BEARER_PREFIX = 'Bearer ';
+  METADATA_CACHE_CONTROL = 'max-age=3600';
+  HEADER_ACCEPT = 'Accept';
 
-  // JSON-RPC 2.0 Error Codes
-  JSONRPC_PARSE_ERROR = -32700;
-  JSONRPC_INVALID_REQUEST = -32600;
-  JSONRPC_METHOD_NOT_FOUND = -32601;
-  JSONRPC_INVALID_PARAMS = -32602;
-  JSONRPC_INTERNAL_ERROR = -32603;
 
-  // SSE Message Format
-  SSE_EVENT_PREFIX = 'event: ';
-  SSE_DATA_PREFIX = 'data: ';
-  SSE_ID_PREFIX = 'id: ';
-  SSE_MESSAGE_TERMINATOR = #10#10;
+  LOOPBACK_IPV4 = '127.0.0.1';
+  LOOPBACK_IPV6 = '::1';
+  ANY_IPV4 = '0.0.0.0';
+  ANY_IPV6 = '::';
 
-  // OAuth endpoint paths
-  OAUTH_WELL_KNOWN_PATH      = '/.well-known/oauth-authorization-server';
-  OAUTH_PROTECTED_RESOURCE   = '/.well-known/oauth-protected-resource';
-  OAUTH_AUTHORIZE_PATH       = '/authorize';
-  OAUTH_TOKEN_PATH           = '/token';
-  OAUTH_REGISTER_PATH        = '/register';
+{ TMCPDiscardedBody }
 
-  // Simple HTML login form — %s slots: error_html, client_id, redirect_uri, code_challenge, state
-  AUTH_FORM_HTML =
-    '<!DOCTYPE html><html><head><title>NexusDB MCP &ndash; Authorize</title>' +
-    '<style>body{font-family:sans-serif;max-width:420px;margin:80px auto;padding:20px}' +
-    'h2{margin-bottom:6px}p{color:#555;margin-top:0}' +
-    'input[type=password]{width:100%%;padding:9px;margin:8px 0 16px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}' +
-    'button{background:#0066cc;color:#fff;border:none;padding:10px 24px;cursor:pointer;border-radius:4px;font-size:14px}' +
-    '.err{color:#c00;margin:8px 0}</style></head>' +
-    '<body><h2>NexusDB MCP Authorization</h2>' +
-    '<p>An application is requesting access to your NexusDB MCP server.</p>%s' +
-    '<form method="post" action="/authorize">' +
-    '<input type="hidden" name="client_id" value="%s">' +
-    '<input type="hidden" name="redirect_uri" value="%s">' +
-    '<input type="hidden" name="code_challenge" value="%s">' +
-    '<input type="hidden" name="code_challenge_method" value="S256">' +
-    '<input type="hidden" name="state" value="%s">' +
-    '<label>Password:<br><input type="password" name="password" autofocus></label>' +
-    '<button type="submit">Authorize</button>' +
-    '</form></body></html>';
+function TMCPDiscardedBody.Write(const Buffer; Count: Longint): Longint;
+begin
+  Result := Count;
+end;
 
 { TMCPIdHTTPServer }
 
@@ -187,18 +175,15 @@ begin
   inherited Create(Owner);
   FPort := DEFAULT_MCP_PORT;
   FActive := False;
-  FEventIDCounter := 0;
   FJsonRpcProcessor := nil;
-  FAuthCodes := TDictionary<string, TAuthCodeEntry>.Create;
-  FAuthCodesLock := TCriticalSection.Create;
-  FRefreshTokens := TDictionary<string, TRefreshTokenEntry>.Create;
-  FRefreshTokensLock := TCriticalSection.Create;
 
   FHTTPServer := TIdHTTPServer.Create(Self);
   FHTTPServer.KeepAlive := True;
   FHTTPServer.OnCommandGet := HandleHTTPRequest;
   FHTTPServer.OnCommandOther := HandleHTTPRequest;
   FHTTPServer.OnQuerySSLPort := HandleQuerySSLPort;
+  FHTTPServer.OnParseAuthentication := HandleParseAuthentication;
+  FHTTPServer.OnCreatePostStream := HandleCreatePostStream;
   FSSLHandler := nil;
 end;
 
@@ -210,12 +195,7 @@ begin
   if Assigned(FSSLHandler) then
     FSSLHandler.Free;
   FJsonRpcProcessor.Free;
-  FAuthCodes.Free;
-  FAuthCodesLock.Free;
-  if Assigned(FRefreshTokens) then
-    SaveRefreshTokens;
-  FRefreshTokens.Free;
-  FRefreshTokensLock.Free;
+  FOAuthServer.Free;
   inherited;
 end;
 
@@ -225,26 +205,55 @@ begin
     Exit;
 
   if not Assigned(FManagerRegistry) then
-    raise Exception.Create('Manager registry not assigned');
+    raise EMCPConfigurationError.Create('Manager registry not assigned');
 
-  FJsonRpcProcessor := TMCPJsonRpcProcessor.Create(FManagerRegistry);
+  FJsonRpcProcessor.Free;
+  FJsonRpcProcessor := TMCPJsonRpcProcessor.Create(FManagerRegistry, FSettings);
 
   if Assigned(FSettings) then
   begin
     FPort := Word(FSettings.Port);
+    FHTTPServer.MaxConnections := FSettings.MaxConnections;
 
     if FSettings.SSLEnabled then
       ConfigureSSL;
   end;
 
-  if Assigned(FSettings) and FSettings.OAuthEnabled then
-    LoadRefreshTokens;
+  if Assigned(FSettings) and FSettings.OAuthEnabled and not Assigned(FOAuthServer) then
+  begin
+    FOAuthServer := TMCPOAuthServer.Create(FSettings);
+    FOAuthServer.LoadRefreshTokens;
+  end;
+
+  if Assigned(FAuthorizer) and (not Assigned(FSettings) or (Length(FSettings.AuthorizationServerList) = 0)) then
+    TLogger.Warning('An authorizer is configured without [Auth] AuthorizationServers: clients cannot discover an authorization server, only pre-shared tokens work');
 
   FHTTPServer.DefaultPort := FPort;
+  ConfigureBindings;
   FHTTPServer.Active := True;
   FActive := True;
 
-  TLogger.Info('MCP Server started on ' + FSettings.Protocol + '://' + FSettings.Host + ':' + IntToStr(FPort));
+  if (FPort = 0) and (FHTTPServer.Bindings.Count > 0) then
+    FPort := FHTTPServer.Bindings[0].Port;
+
+  TLogger.Info('MCP Server listening on ' + string.Join(', ', BoundAddresses));
+end;
+
+procedure TMCPIdHTTPServer.CloseSubscriptions;
+var
+  Hub: IMCPSubscriptionHub;
+begin
+  if not Assigned(FManagerRegistry) or
+    not Supports(FManagerRegistry.GetManagerForMethod(MCP_METHOD_SUBSCRIPTIONS_LISTEN), IMCPSubscriptionHub, Hub) then
+    Exit;
+
+  var Deadline := TThread.GetTickCount64 + SUBSCRIPTION_CLOSE_GRACE_MS;
+  repeat
+    Hub.CloseAll('server stopping');
+    if Hub.ActiveCount = 0 then
+      Break;
+    Sleep(SUBSCRIPTION_CLOSE_POLL_MS);
+  until TThread.GetTickCount64 >= Deadline;
 end;
 
 procedure TMCPIdHTTPServer.Stop;
@@ -252,305 +261,102 @@ begin
   if not FActive then
     Exit;
 
+  CloseSubscriptions;
   FHTTPServer.Active := False;
   FActive := False;
   TLogger.Info('MCP Server stopped');
 end;
 
-procedure TMCPIdHTTPServer.HandleHTTPRequest(Context: TIdContext;
-  RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
-var
-  RequestPath: string;
-  AuthHeader: string;
-  BearerToken: string;
-  I: Integer;
+function TMCPIdHTTPServer.BoundAddresses: TArray<string>;
 begin
-  TServerStatusResource.ConnectionOpened;
-  try
-    TServerStatusResource.IncrementRequestCount;
-
-    RequestPath := RequestInfo.Document;
-
-    // OAuth discovery endpoints are always public — route before CORS check
-    if RequestPath = OAUTH_WELL_KNOWN_PATH then
-    begin
-      ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
-      HandleWellKnownOAuth(RequestInfo, ResponseInfo);
-      Exit;
-    end;
-
-    // RFC 9728: /.well-known/oauth-protected-resource/{resource-path}
-    if RequestPath.StartsWith(OAUTH_PROTECTED_RESOURCE) then
-    begin
-      ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
-      HandleProtectedResourceMetadata(RequestInfo, ResponseInfo);
-      Exit;
-    end;
-
-    // OAuth flow endpoints manage their own CORS — route before the CORS check
-    if RequestPath = OAUTH_AUTHORIZE_PATH then
-    begin
-      if Assigned(FSettings) and FSettings.OAuthEnabled then
-        HandleAuthorize(RequestInfo, ResponseInfo)
-      else
-      begin
-        ResponseInfo.ResponseNo := HTTP_NOT_FOUND;
-        ResponseInfo.ResponseText := 'Not Found';
-      end;
-      Exit;
-    end;
-
-    if RequestPath = OAUTH_TOKEN_PATH then
-    begin
-      if Assigned(FSettings) and FSettings.OAuthEnabled then
-        HandleToken(RequestInfo, ResponseInfo)
-      else
-      begin
-        ResponseInfo.ResponseNo := HTTP_NOT_FOUND;
-        ResponseInfo.ResponseText := 'Not Found';
-      end;
-      Exit;
-    end;
-
-    if RequestPath = OAUTH_REGISTER_PATH then
-    begin
-      if Assigned(FSettings) and FSettings.OAuthEnabled then
-        HandleRegister(RequestInfo, ResponseInfo)
-      else
-      begin
-        ResponseInfo.ResponseNo := HTTP_NOT_FOUND;
-        ResponseInfo.ResponseText := 'Not Found';
-      end;
-      Exit;
-    end;
-
-    if not VerifyAndSetCORSHeaders(RequestInfo, ResponseInfo) then
-      Exit;
-
-    // Only handle requests to the configured MCP endpoint
-    if RequestPath <> FSettings.Endpoint then
-    begin
-      ResponseInfo.ResponseNo := HTTP_NOT_FOUND;
-      ResponseInfo.ResponseText := 'Not Found';
-      Exit;
-    end;
-
-    // Validate Bearer token on the MCP endpoint when OAuth is enabled
-    if Assigned(FSettings) and FSettings.OAuthEnabled and (RequestInfo.Command <> 'OPTIONS') then
-    begin
-      // Read from X-MCP-Authorization (nginx renames Authorization to avoid Indy's
-      // built-in auth interception which returns 401 before our handler is called).
-      // Fall back to Authorization for direct connections that bypass nginx.
-      AuthHeader := '';
-      for I := 0 to RequestInfo.RawHeaders.Count - 1 do
-      begin
-        var RawLine := RequestInfo.RawHeaders[I];
-        var ColonPos := RawLine.IndexOf(':');
-        if ColonPos > 0 then
-        begin
-          var HdrName := RawLine.Substring(0, ColonPos).Trim.ToLower;
-          if HdrName = 'x-mcp-authorization' then
-          begin
-            AuthHeader := RawLine.Substring(ColonPos + 1).Trim;
-            Break;
-          end
-          else if (HdrName = 'authorization') and (AuthHeader = '') then
-            AuthHeader := RawLine.Substring(ColonPos + 1).Trim;
-        end;
-      end;
-
-      if AuthHeader.StartsWith('Bearer ', True) then
-        BearerToken := AuthHeader.Substring(7).Trim
-      else
-        BearerToken := '';
-
-      TLogger.Info(Format('MCP auth: Authorization header length=%d, token length=%d',
-        [Length(AuthHeader), Length(BearerToken)]));
-
-      if not ValidateBearerToken(BearerToken) then
-      begin
-        ResponseInfo.ResponseNo := HTTP_UNAUTHORIZED;
-        ResponseInfo.ResponseText := 'Unauthorized';
-        // RFC 9728 / MCP 2025-06-18: the 401 MUST point the client at the
-        // protected-resource metadata so it can discover the authorization
-        // server. Newer MCP clients (e.g. Claude Desktop) require the
-        // resource_metadata parameter here and no longer fall back to probing
-        // .well-known paths — without it OAuth discovery never starts and the
-        // login page is never shown.
-        ResponseInfo.CustomHeaders.Values['WWW-Authenticate'] :=
-          Format('Bearer realm="%0:s", resource_metadata="%0:s%1:s%2:s"',
-            [GetRequestBaseURL(RequestInfo), OAUTH_PROTECTED_RESOURCE, FSettings.Endpoint]);
-        ResponseInfo.ContentType := 'application/json';
-        ResponseInfo.ContentText := '{"error":"invalid_token"}';
-        TLogger.Warning('Rejected unauthenticated MCP request from: ' + RequestInfo.RemoteIP);
-        Exit;
-      end;
-    end;
-
-    if RequestInfo.Command = 'OPTIONS' then
-      HandleOptionsRequest(ResponseInfo)
-    else if RequestInfo.CommandType = hcGET then
-      HandleGetRequest(RequestInfo, ResponseInfo)
-    else if RequestInfo.CommandType = hcPOST then
-      HandlePostRequest(RequestInfo, ResponseInfo)
+  Result := nil;
+  for var I := 0 to FHTTPServer.Bindings.Count - 1 do
+  begin
+    var Binding := FHTTPServer.Bindings[I];
+    const IsId_IPv6 = (Binding.IPVersion = Id_IPv6);
+    if IsId_IPv6 then
+      Result := Result + [Format('[%s]:%d', [Binding.IP, Binding.Port])]
     else
-    begin
-      ResponseInfo.ResponseNo := HTTP_METHOD_NOT_ALLOWED;
-      ResponseInfo.ResponseText := 'Method Not Allowed';
-    end;
+      Result := Result + [Format('%s:%d', [Binding.IP, Binding.Port])];
+  end;
+end;
+
+function TMCPIdHTTPServer.BoundPort: Word;
+begin
+  if FHTTPServer.Bindings.Count > 0 then
+    Result := Word(FHTTPServer.Bindings[0].Port)
+  else
+    Result := FPort;
+end;
+
+procedure TMCPIdHTTPServer.AddBinding(const IP: string; IPVersion: TIdIPVersion);
+begin
+  var Binding := FHTTPServer.Bindings.Add;
+  Binding.IP := IP;
+  Binding.Port := FPort;
+  Binding.IPVersion := IPVersion;
+end;
+
+function TMCPIdHTTPServer.ClaimEphemeralPort(const IP: string): Word;
+begin
+  const Probe = TIdSocketHandle.Create(nil);
+  try
+    Probe.IPVersion := Id_IPv4;
+    Probe.IP := IP;
+    Probe.Port := 0;
+    Probe.AllocateSocket;
+    Probe.Bind;
+    Result := Word(Probe.Port);
+    Probe.CloseSocket;
   finally
-    TServerStatusResource.ConnectionClosed;
+    Probe.Free;
   end;
 end;
 
-function TMCPIdHTTPServer.VerifyAndSetCORSHeaders(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo): Boolean;
-var
-  AllowedOrigin: string;
-  CurrentOrigin: string;
-  Found: Boolean;
-  Origin: string;
-  OriginsList: TStringList;
+procedure TMCPIdHTTPServer.AddDualStackBindings(const IPv4Address, IPv6Address: string);
 begin
-  Result := True;
+  const BindsBothFamilies = GStack.SupportsIPv6;
+  const SystemPicksThePort = (FPort = 0);
+  if BindsBothFamilies and SystemPicksThePort then
+    FPort := ClaimEphemeralPort(IPv4Address);
 
-  if not Assigned(FSettings) or not FSettings.CorsEnabled then
+  AddBinding(IPv4Address, Id_IPv4);
+  if BindsBothFamilies then
+    AddBinding(IPv6Address, Id_IPv6);
+end;
+
+procedure TMCPIdHTTPServer.ConfigureBindings;
+begin
+  FHTTPServer.Bindings.Clear;
+
+  var Address := '';
+  var Host := HOST_LOCALHOST;
+  if Assigned(FSettings) then
+  begin
+    Address := FSettings.BindAddress.Trim;
+    Host := FSettings.Host.Trim;
+  end;
+
+  const HasAddress = (Address <> '');
+  if HasAddress then
+  begin
+    if (Address = ANY_IPV4) or (Address = ANY_IPV6) then
+      TLogger.Warning('BindAddress ' + Address + ': the server is reachable from every network interface');
+    if Address.Contains(':') then
+      AddBinding(Address, Id_IPv6)
+    else
+      AddBinding(Address, Id_IPv4);
     Exit;
-
-  Origin := RequestInfo.RawHeaders.Values['Origin'];
-  AllowedOrigin := '*';
-
-  if (FSettings.CorsAllowedOrigins <> '*') and (Origin <> '') then
-  begin
-    OriginsList := TStringList.Create;
-    try
-      OriginsList.CommaText := FSettings.CorsAllowedOrigins;
-      Found := False;
-
-      for CurrentOrigin in OriginsList do
-      begin
-        if SameText(Trim(CurrentOrigin), Origin) then
-        begin
-          AllowedOrigin := Origin;
-          Found := True;
-          Break;
-        end;
-      end;
-
-      if not Found then
-      begin
-        Result := False;
-        ResponseInfo.ResponseNo := HTTP_FORBIDDEN;
-        ResponseInfo.ResponseText := 'Forbidden - Origin not allowed';
-        TLogger.Info('CORS blocked origin: ' + Origin);
-        Exit;
-      end;
-    finally
-      OriginsList.Free;
-    end;
   end;
 
-  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := AllowedOrigin;
-  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Methods'] := 'POST, GET, OPTIONS';
-  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Headers'] :=
-    'Accept, Content-Type, Last-Event-ID, Mcp-Protocol-Version, Mcp-Session-Id, Authorization';
-  ResponseInfo.CustomHeaders.Values['Access-Control-Expose-Headers'] := 'Mcp-Session-Id';
-  ResponseInfo.CustomHeaders.Values['Access-Control-Max-Age'] := CORS_MAX_AGE.ToString;
-end;
-
-procedure TMCPIdHTTPServer.HandleOptionsRequest(ResponseInfo: TIdHTTPResponseInfo);
-begin
-  ResponseInfo.ResponseNo := HTTP_OK;
-  ResponseInfo.ResponseText := 'OK';
-end;
-
-procedure TMCPIdHTTPServer.HandleGetRequest(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  AcceptHeader: string;
-  SessionID: string;
-begin
-  AcceptHeader := RequestInfo.RawHeaders.Values['Accept'];
-
-  if AcceptsSSE(AcceptHeader) then
+  if SameText(Host, HOST_LOCALHOST) or (Host = LOOPBACK_IPV4) or (Host = LOOPBACK_IPV6) then
   begin
-    TLogger.Debug('Received GET request - opening SSE stream for server-initiated messages');
-
-    ResponseInfo.ContentType := 'text/event-stream';
-    ResponseInfo.CharSet := 'utf-8';
-    ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-cache';
-    ResponseInfo.CustomHeaders.Values['Connection'] := 'keep-alive';
-    ResponseInfo.CustomHeaders.Values['X-Accel-Buffering'] := 'no';
-
-    SessionID := RequestInfo.RawHeaders.Values['Mcp-Session-Id'];
-    if SessionID <> '' then
-      ResponseInfo.CustomHeaders.Values['Mcp-Session-Id'] := SessionID;
-
-    ResponseInfo.ResponseNo := HTTP_OK;
-    ResponseInfo.ContentText := '';
-
-    TLogger.Debug('SSE stream opened (no server-initiated messages to send)');
+    AddDualStackBindings(LOOPBACK_IPV4, LOOPBACK_IPV6);
   end
   else
   begin
-    TLogger.Info('Received GET request - returning endpoint info');
-
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-cache';
-    ResponseInfo.CustomHeaders.Values['Connection'] := 'keep-alive';
-
-    ResponseInfo.ContentText := '{"url": "' + FSettings.Protocol + '://' + FSettings.Host + ':' + IntToStr(FPort) +
-                    FSettings.Endpoint + '", "transport": "' + FSettings.Protocol + '"}';
-
-    ResponseInfo.ResponseNo := HTTP_OK;
-  end;
-end;
-
-procedure TMCPIdHTTPServer.HandlePostRequest(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  AcceptHeader: string;
-  JSONRequest: TJSONValue;
-  RequestBody: string;
-  SessionID: string;
-begin
-  RequestBody := '';
-  if Assigned(RequestInfo.PostStream) and (RequestInfo.PostStream.Size > 0) then
-  begin
-    RequestInfo.PostStream.Position := 0;
-    RequestBody := ReadStringFromStream(RequestInfo.PostStream, -1, IndyTextEncoding_UTF8);
-  end;
-
-  TLogger.Info('Request: ' + RequestBody);
-
-  SessionID := RequestInfo.RawHeaders.Values['Mcp-Session-Id'];
-  if SessionID <> '' then
-    TLogger.Info('Session ID from header: ' + SessionID);
-
-  AcceptHeader := RequestInfo.RawHeaders.Values['Accept'];
-
-  JSONRequest := nil;
-  try
-    JSONRequest := TJSONObject.ParseJSONValue(RequestBody);
-
-    if Assigned(JSONRequest) and IsRequestOnlyNotificationsOrResponses(JSONRequest) then
-    begin
-      TLogger.Info('Request contains only notifications/responses, returning 202 Accepted');
-      ResponseInfo.ResponseNo := HTTP_ACCEPTED;
-
-      if SessionID <> '' then
-        ResponseInfo.CustomHeaders.Values['Mcp-Session-Id'] := SessionID;
-
-      Exit;
-    end;
-
-    if AcceptsSSE(AcceptHeader) then
-      HandlePostRequestSSE(RequestInfo, ResponseInfo, RequestBody, SessionID)
-    else
-      HandlePostRequestJSON(RequestInfo, ResponseInfo, RequestBody, SessionID);
-
-  finally
-    JSONRequest.Free;
+    TLogger.Info('Host ' + Host + ' is not loopback; listening on every network interface (set BindAddress to narrow this)');
+    AddDualStackBindings(ANY_IPV4, ANY_IPV6);
   end;
 end;
 
@@ -558,18 +364,17 @@ procedure TMCPIdHTTPServer.ConfigureSSL;
 begin
   if not TFile.Exists(FSettings.SSLCertFile) then
   begin
-    TLogger.Error('SSL Certificate file not found: ' + FSettings.SSLCertFile);
-    raise Exception.Create('SSL Certificate file not found: ' + FSettings.SSLCertFile);
+    TLogger.Error(Format(MESSAGE_NO_CERTIFICATE, [FSettings.SSLCertFile]));
+    raise EMCPConfigurationError.CreateFmt(MESSAGE_NO_CERTIFICATE, [FSettings.SSLCertFile]);
   end;
 
   if not TFile.Exists(FSettings.SSLKeyFile) then
   begin
-    TLogger.Error('SSL Key file not found: ' + FSettings.SSLKeyFile);
-    raise Exception.Create('SSL Key file not found: ' + FSettings.SSLKeyFile);
+    TLogger.Error(Format(MESSAGE_NO_KEY, [FSettings.SSLKeyFile]));
+    raise EMCPConfigurationError.CreateFmt(MESSAGE_NO_KEY, [FSettings.SSLKeyFile]);
   end;
 
   {$IFDEF USE_TAURUS_TLS}
-  // TaurusTLS with OpenSSL 3.x/4.x support
   FSSLHandler := TTaurusTLSServerIOHandler.Create(Self);
   FSSLHandler.DefaultCert.PublicKey := FSettings.SSLCertFile;
   FSSLHandler.DefaultCert.PrivateKey := FSettings.SSLKeyFile;
@@ -582,7 +387,7 @@ begin
     FSSLHandler.SSLOptions.RootCertFile := FSettings.SSLRootCertFile;
 
   FSSLHandler.SSLOptions.Method := sslvTLSv1_2;
-  FSSLHandler.SSLOptions.SSLVersions := [sslvTLSv1, sslvTLSv1_1, sslvTLSv1_2];
+  FSSLHandler.SSLOptions.SSLVersions := [sslvTLSv1_2];
   FSSLHandler.SSLOptions.Mode := sslmServer;
   {$ENDIF}
 
@@ -591,894 +396,516 @@ begin
   TLogger.Info('SSL configured successfully');
   TLogger.Info('Certificate: ' + FSettings.SSLCertFile);
   TLogger.Info('Private Key: ' + FSettings.SSLKeyFile);
-  if FSettings.SSLRootCertFile <> '' then
+  const HasSSLRootCertFile = (FSettings.SSLRootCertFile <> '');
+  if HasSSLRootCertFile then
     TLogger.Info('Root Certificate: ' + FSettings.SSLRootCertFile);
+end;
+
+procedure TMCPIdHTTPServer.HandleParseAuthentication(Context: TIdContext; const AuthType, AuthData: string;
+  var VUsername, VPassword: string; var VHandled: Boolean);
+begin
+  VUsername := '';
+  VPassword := '';
+  VHandled := True;
 end;
 
 procedure TMCPIdHTTPServer.HandleQuerySSLPort(APort: Word; var VUseSSL: Boolean);
 begin
-  VUseSSL := FSettings.SSLEnabled and (APort = FPort);
+  VUseSSL := Assigned(FSettings) and FSettings.SSLEnabled and (APort = FPort);
 end;
 
-function TMCPIdHTTPServer.GetNextEventID: string;
+function TMCPIdHTTPServer.HeaderPresent(RequestInfo: TIdHTTPRequestInfo; const Name: string): Boolean;
 begin
-  Inc(FEventIDCounter);
-  Result := IntToStr(FEventIDCounter);
+  Result := RequestInfo.RawHeaders.IndexOfName(Name) >= 0;
 end;
 
-function TMCPIdHTTPServer.AcceptsSSE(const AcceptHeader: string): Boolean;
+function TMCPIdHTTPServer.HeaderValue(RequestInfo: TIdHTTPRequestInfo; const Name: string): string;
 begin
-  Result := Pos('text/event-stream', AcceptHeader) > 0;
+  Result := Trim(RequestInfo.RawHeaders.Values[Name]);
 end;
 
-function TMCPIdHTTPServer.IsRequestOnlyNotificationsOrResponses(JSONRequest: TJSONValue): Boolean;
-var
-  Arr: TJSONArray;
-  ErrorValue: TJSONValue;
-  I: Integer;
-  IdValue: TJSONValue;
-  MethodValue: TJSONValue;
-  Obj: TJSONObject;
-  ResultValue: TJSONValue;
+function TMCPIdHTTPServer.IsListedHeader(const List, Name: string): Boolean;
 begin
-  if JSONRequest is TJSONObject then
+  for var Listed in List.Split([',']) do
   begin
-    Obj := JSONRequest as TJSONObject;
-    MethodValue := Obj.GetValue('method');
-    IdValue := Obj.GetValue('id');
-    ResultValue := Obj.GetValue('result');
-    ErrorValue := Obj.GetValue('error');
-
-    if Assigned(MethodValue) and not Assigned(IdValue) then
+    if SameText(Listed.Trim, Name) then
       Exit(True);
-
-    if Assigned(ResultValue) or Assigned(ErrorValue) then
-      Exit(True);
-
-    Result := False;
-  end
-  else if JSONRequest is TJSONArray then
-  begin
-    Arr := JSONRequest as TJSONArray;
-    Result := True;
-    for I := 0 to Arr.Count - 1 do
-    begin
-      if not IsRequestOnlyNotificationsOrResponses(Arr.Items[I]) then
-      begin
-        Result := False;
-        Break;
-      end;
-    end;
-  end
-  else
-    Result := False;
-end;
-
-procedure TMCPIdHTTPServer.HandlePostRequestSSE(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo; const RequestBody: string; const SessionID: string);
-var
-  EventID: string;
-  JSONResponse: string;
-  SSEMessage: string;
-begin
-  TLogger.Info('Handling POST request with SSE stream');
-
-  ResponseInfo.ContentType := 'text/event-stream';
-  ResponseInfo.CharSet := 'utf-8';
-  ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-cache';
-  ResponseInfo.CustomHeaders.Values['Connection'] := 'keep-alive';
-  ResponseInfo.CustomHeaders.Values['X-Accel-Buffering'] := 'no';
-
-  if SessionID <> '' then
-    ResponseInfo.CustomHeaders.Values['Mcp-Session-Id'] := SessionID;
-
-  JSONResponse := FJsonRpcProcessor.ProcessRequest(RequestBody, SessionID);
-
-  if JSONResponse <> '' then
-  begin
-    EventID := GetNextEventID;
-    SSEMessage := '';
-
-    if EventID <> '' then
-      SSEMessage := SSEMessage + SSE_ID_PREFIX + EventID + #10;
-
-    SSEMessage := SSEMessage + SSE_EVENT_PREFIX + 'message' + #10;
-    SSEMessage := SSEMessage + SSE_DATA_PREFIX + JSONResponse + SSE_MESSAGE_TERMINATOR;
-
-    ResponseInfo.ContentText := SSEMessage;
-    TLogger.Info('SSE response prepared with event ID: ' + EventID);
-  end
-  else
-  begin
-    ResponseInfo.ContentText := '';
   end;
-
-  ResponseInfo.ResponseNo := HTTP_OK;
+  Result := False;
 end;
 
-procedure TMCPIdHTTPServer.HandlePostRequestJSON(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo; const RequestBody: string; const SessionID: string);
-var
-  ResponseBody: string;
-  ResponseJSON: TJSONObject;
-  ResultObj: TJSONObject;
-  SessionValue: TJSONValue;
+function TMCPIdHTTPServer.MaxBodyBytes: Integer;
 begin
-  TLogger.Info('Handling POST request with JSON response');
-
-  ResponseBody := FJsonRpcProcessor.ProcessRequest(RequestBody, SessionID);
-
-  if ResponseBody = '' then
-  begin
-    ResponseInfo.ResponseNo := HTTP_NO_CONTENT;
-    Exit;
-  end;
-
-  ResponseInfo.ContentType := 'application/json';
-  ResponseInfo.CustomHeaders.Values['Connection'] := 'keep-alive';
-
-  if (SessionID = '') and (Pos('"sessionId"', ResponseBody) > 0) then
-  begin
-    ResponseJSON := TJSONObject.ParseJSONValue(ResponseBody) as TJSONObject;
-    try
-      ResultObj := ResponseJSON.GetValue('result') as TJSONObject;
-      if Assigned(ResultObj) then
-      begin
-        SessionValue := ResultObj.GetValue('sessionId');
-        if Assigned(SessionValue) then
-          ResponseInfo.CustomHeaders.Values['Mcp-Session-Id'] := SessionValue.Value;
-      end;
-    finally
-      ResponseJSON.Free;
-    end;
-  end
-  else if SessionID <> '' then
-    ResponseInfo.CustomHeaders.Values['Mcp-Session-Id'] := SessionID;
-
-  ResponseInfo.ContentStream := TStringStream.Create(ResponseBody, TEncoding.UTF8);
-  ResponseInfo.FreeContentStream := True;
-  ResponseInfo.ResponseNo := HTTP_OK;
-
-  TLogger.Info('Response: ' + ResponseBody);
+  Result := TMCPSettings.DEFAULT_MAX_REQUEST_BODY_BYTES;
+  if Assigned(FSettings) then
+    Result := FSettings.MaxRequestBodyBytes;
 end;
 
-// ── OAuth helpers ────────────────────────────────────────────────────────────
-
-function TMCPIdHTTPServer.Base64URLEncode(const Bytes: TBytes): string;
+procedure TMCPIdHTTPServer.HandleCreatePostStream(Context: TIdContext; Headers: TIdHeaderList;
+  var VPostStream: TStream);
 begin
-  Result := TNetEncoding.Base64.EncodeBytesToString(Bytes);
-  // Strip line breaks that Delphi's Base64 encoder adds every 76 chars —
-  // newlines in a JWT would break Authorization header transmission
-  Result := Result.Replace(#13#10, '', [rfReplaceAll])
-                  .Replace(#13,    '', [rfReplaceAll])
-                  .Replace(#10,    '', [rfReplaceAll])
-                  .Replace('+', '-', [rfReplaceAll])
-                  .Replace('/', '_', [rfReplaceAll])
-                  .Replace('=', '',  [rfReplaceAll]);
+  const Declared = StrToInt64Def(Headers.Values['Content-Length'], 0);
+  const TooLarge = (Declared > MaxBodyBytes);
+  if TooLarge then
+    VPostStream := TMCPDiscardedBody.Create;
 end;
 
-function TMCPIdHTTPServer.Base64URLDecode(const S: string): TBytes;
-var
-  Padded: string;
+procedure TMCPIdHTTPServer.HandleHTTPRequest(Context: TIdContext;
+  RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
 begin
-  Padded := S.Replace('-', '+', [rfReplaceAll]).Replace('_', '/', [rfReplaceAll]);
-  case Length(Padded) mod 4 of
-    2: Padded := Padded + '==';
-    3: Padded := Padded + '=';
-  end;
-  Result := TNetEncoding.Base64.DecodeStringToBytes(Padded);
-end;
-
-function TMCPIdHTTPServer.ParseFormParams(const Body: string): TDictionary<string, string>;
-var
-  Pairs: TArray<string>;
-  Parts: TArray<string>;
-begin
-  Result := TDictionary<string, string>.Create;
-  Pairs := Body.Split(['&']);
-  for var Pair in Pairs do
-  begin
-    Parts := Pair.Split(['='], 2);
-    if Length(Parts) = 2 then
-      Result.AddOrSetValue(TIdURI.URLDecode(Parts[0]), TIdURI.URLDecode(Parts[1]));
-  end;
-end;
-
-function TMCPIdHTTPServer.GetRequestBaseURL(RequestInfo: TIdHTTPRequestInfo): string;
-var
-  Proto, Host: string;
-begin
-  // Honour nginx X-Forwarded-Proto so we advertise the public https:// URL
-  Proto := RequestInfo.RawHeaders.Values['X-Forwarded-Proto'];
-  if Proto = '' then
-  begin
-    if Assigned(FSettings) and FSettings.SSLEnabled then Proto := 'https'
-    else Proto := 'http';
-  end;
-  Host := RequestInfo.RawHeaders.Values['Host'];
-  if Host = '' then
-  begin
-    if Assigned(FSettings) then
-      Host := FSettings.Host + ':' + IntToStr(FSettings.Port)
-    else
-      Host := 'localhost:' + IntToStr(FPort);
-  end;
-  Result := Proto + '://' + Host;
-end;
-
-function TMCPIdHTTPServer.GenerateAuthCode: string;
-var
-  G: TGUID;
-begin
-  CreateGUID(G);
-  Result := GUIDToString(G).Replace('{', '', [rfReplaceAll])
-                            .Replace('}', '', [rfReplaceAll])
-                            .Replace('-', '', [rfReplaceAll])
-                            .ToLower;
-end;
-
-procedure TMCPIdHTTPServer.CleanExpiredAuthCodes;
-var
-  Expired: TList<string>;
-begin
-  Expired := TList<string>.Create;
+  TServerStatusResource.ConnectionOpened;
   try
-    for var Pair in FAuthCodes do
-      if Now > Pair.Value.ExpiresAt then
-        Expired.Add(Pair.Key);
-    for var Key in Expired do
-      FAuthCodes.Remove(Key);
+    TServerStatusResource.IncrementRequestCount;
+
+    ApplyCorsHeaders(RequestInfo, ResponseInfo);
+
+    // The authorization server's endpoints are public and are reached from the
+    // user's browser (the login form posts from the public host), so they are
+    // routed ahead of the Host/Origin checks that guard the MCP endpoint.
+    if Assigned(FOAuthServer) and FOAuthServer.TryHandle(RequestInfo, ResponseInfo) then
+      Exit;
+
+    if not ValidateHost(RequestInfo, ResponseInfo) or not ValidateOrigin(RequestInfo, ResponseInfo) then
+      Exit;
+
+    var Endpoint := DEFAULT_ENDPOINT;
+    var EndpointInfoPath := '';
+    if Assigned(FSettings) then
+    begin
+      Endpoint := FSettings.Endpoint;
+      EndpointInfoPath := FSettings.EndpointInfoPath;
+    end;
+
+    if (EndpointInfoPath <> '') and (RequestInfo.Document = EndpointInfoPath) and (RequestInfo.CommandType = hcGET) then
+    begin
+      HandleEndpointInfo(ResponseInfo);
+      Exit;
+    end;
+
+    if Assigned(FAuthorizer) and (RequestInfo.CommandType = hcGET) and
+      IsProtectedResourceMetadataPath(RequestInfo.Document) then
+    begin
+      HandleProtectedResourceMetadata(ResponseInfo);
+      Exit;
+    end;
+
+    const IsNotEndpoint = (RequestInfo.Document <> Endpoint);
+    if IsNotEndpoint then
+    begin
+      SendEmpty(ResponseInfo, HTTP_STATUS_NOT_FOUND);
+      Exit;
+    end;
+
+    if RequestInfo.Command = 'OPTIONS' then
+    begin
+      SendEmpty(ResponseInfo, HTTP_NO_CONTENT);
+      Exit;
+    end;
+
+    var Principal := TMCPPrincipal.None;
+    if Assigned(FOAuthServer) then
+    begin
+      // Tokens from the built-in authorization server carry no scopes.
+      if not FOAuthServer.Authenticate(RequestInfo, ResponseInfo) then
+        Exit;
+    end
+    else if Assigned(FAuthorizer) and not TryAuthenticate(RequestInfo, ResponseInfo, Principal) then
+      Exit;
+
+    if RequestInfo.CommandType = hcPOST then
+      HandlePostRequest(Context, RequestInfo, ResponseInfo, Principal)
+    else
+      SendMethodNotAllowed(ResponseInfo);
   finally
-    Expired.Free;
+    TServerStatusResource.ConnectionClosed;
   end;
 end;
 
-function TMCPIdHTTPServer.GenerateJWT: string;
-var
-  Header, Payload, SignInput: string;
-  NowUnix, ExpUnix: Int64;
-  KeyBytes, SigBytes: TBytes;
+function TMCPIdHTTPServer.AllowedOrigins: TArray<string>;
 begin
-  NowUnix := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now));
-  ExpUnix  := NowUnix + FSettings.OAuthTokenExpiry;
+  Result := nil;
+  if not Assigned(FSettings) then
+    Exit;
 
-  Header  := '{"alg":"HS256","typ":"JWT"}';
-  Payload := Format('{"iat":%d,"exp":%d,"iss":"nxmcp"}', [NowUnix, ExpUnix]);
+  var List := FSettings.AllowedOrigins;
+  const ListIsEmpty = (List.Trim = '');
+  if ListIsEmpty then
+    Exit;
 
-  var HeaderEnc  := Base64URLEncode(TEncoding.UTF8.GetBytes(Header));
-  var PayloadEnc := Base64URLEncode(TEncoding.UTF8.GetBytes(Payload));
-  SignInput := HeaderEnc + '.' + PayloadEnc;
-
-  KeyBytes := TEncoding.UTF8.GetBytes(FSettings.OAuthTokenSecret);
-  SigBytes := THashSHA2.GetHMACAsBytes(TEncoding.UTF8.GetBytes(SignInput), KeyBytes);
-
-  Result := SignInput + '.' + Base64URLEncode(SigBytes);
+  for var Entry in List.Split([',']) do
+    if Entry.Trim <> '' then
+      Result := Result + [Entry.Trim];
 end;
 
-function TMCPIdHTTPServer.ValidateBearerToken(const Token: string): Boolean;
-var
-  Parts: TArray<string>;
-  SignInput: string;
-  KeyBytes, SigBytes, ExpectedSig: TBytes;
-  PayloadStr: string;
-  PayloadJSON: TJSONObject;
-  ExpValue: Int64;
+function TMCPIdHTTPServer.ValidateOrigin(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo): Boolean;
 begin
+  if not HeaderPresent(RequestInfo, HEADER_ORIGIN) then
+    Exit(True);
+
+  var Origin := HeaderValue(RequestInfo, HEADER_ORIGIN);
+  ResponseInfo.CustomHeaders.Values['Vary'] := HEADER_ORIGIN;
+
+  if TMCPOriginPolicy.IsAllowed(Origin, AllowedOrigins) then
+    Exit(True);
+
+  TLogger.Warning('Origin not allowed: ' + Origin);
+  SendJsonRpcError(ResponseInfo, HTTP_FORBIDDEN, JSONRPC_INVALID_REQUEST, 'Origin not allowed');
+  Result := False;
+end;
+
+function TMCPIdHTTPServer.ValidateHost(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo): Boolean;
+begin
+  if not Assigned(FSettings) or TMCPHostPolicy.IsAllowed(RequestInfo.Host, FSettings.AllowedHostList) then
+    Exit(True);
+
+  TLogger.Warning('Host not allowed: ' + RequestInfo.Host);
+  SendJsonRpcError(ResponseInfo, HTTP_FORBIDDEN, JSONRPC_INVALID_REQUEST, 'Host not allowed');
+  Result := False;
+end;
+
+procedure TMCPIdHTTPServer.ApplyCorsHeaders(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
+begin
+  if not Assigned(FSettings) or not FSettings.CorsEnabled then
+    Exit;
+
+  var Origin := HeaderValue(RequestInfo, HEADER_ORIGIN);
+  var AllowAll := False;
+  for var Entry in AllowedOrigins do
+    if Entry = TMCPOriginPolicy.ALLOW_ALL then
+      AllowAll := True;
+
+  if (Origin = '') or AllowAll then
+    ResponseInfo.CustomHeaders.Values[HEADER_ALLOW_ORIGIN] := TMCPOriginPolicy.ALLOW_ALL
+  else
+    ResponseInfo.CustomHeaders.Values[HEADER_ALLOW_ORIGIN] := Origin;
+
+  var AllowHeaders := CORS_ALLOW_HEADERS;
+  for var Requested in HeaderValue(RequestInfo, 'Access-Control-Request-Headers').Split([',']) do
+  begin
+    const Name = Requested.Trim;
+    const IsNew = ((Name <> '') and not IsListedHeader(AllowHeaders, Name));
+    if IsNew then
+      AllowHeaders := Format('%s, %s', [AllowHeaders, Name]);
+  end;
+
+  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Methods'] := CORS_ALLOW_METHODS;
+  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Headers'] := AllowHeaders;
+  ResponseInfo.CustomHeaders.Values['Access-Control-Expose-Headers'] := CORS_EXPOSE_HEADERS;
+  ResponseInfo.CustomHeaders.Values['Access-Control-Max-Age'] := CORS_MAX_AGE.ToString;
+end;
+
+procedure TMCPIdHTTPServer.HandleEndpointInfo(ResponseInfo: TIdHTTPResponseInfo);
+begin
+  var Info := TJSONObject.Create;
+  try
+    Info.AddPair('url', FSettings.Protocol + '://' + FSettings.Host + ':' + IntToStr(FPort) + FSettings.Endpoint);
+    Info.AddPair('transport', 'streamable-http');
+    var Versions := TJSONArray.Create;
+    Info.AddPair('protocolVersions', Versions);
+    for var Version in MCP_MODERN_PROTOCOL_VERSIONS do
+    begin
+      Versions.Add(Version);
+    end;
+    for var Version in MCP_LEGACY_PROTOCOL_VERSIONS do
+    begin
+      Versions.Add(Version);
+    end;
+    SendJson(ResponseInfo, HTTP_STATUS_OK, Info.ToJSON);
+  finally
+    Info.Free;
+  end;
+end;
+
+function TMCPIdHTTPServer.ConfiguredResourceUri: string;
+begin
+  Result := '';
+  if not Assigned(FSettings) then
+    Exit;
+
+  const ResourceUriSetting = FSettings.ResourceUri;
+  Result := ResourceUriSetting.Trim;
+end;
+
+function TMCPIdHTTPServer.IsPublicResourceMetadataPath(const Document: string): Boolean;
+begin
+  const PublicResourceUri = ConfiguredResourceUri;
+  const PublicMetadataPath = TMCPProtectedResourceMetadata.PathFor(PublicResourceUri);
+  const HasPublicMetadataPath = (PublicMetadataPath <> '');
+
+  Result := (HasPublicMetadataPath and (Document = PublicMetadataPath));
+end;
+
+function TMCPIdHTTPServer.IsProtectedResourceMetadataPath(const Document: string): Boolean;
+begin
+  var Endpoint := DEFAULT_ENDPOINT;
+  if Assigned(FSettings) then
+    Endpoint := FSettings.Endpoint;
+  const IsPublicPath = IsPublicResourceMetadataPath(Document);
+
+  Result := ((Document = TMCPProtectedResourceMetadata.WELL_KNOWN_PATH) or
+             (Document = TMCPProtectedResourceMetadata.WELL_KNOWN_PATH + Endpoint) or
+             IsPublicPath);
+end;
+
+function TMCPIdHTTPServer.ResourceUri: string;
+begin
+  Result := '';
+  if Assigned(FSettings) then
+    Result := FSettings.ResourceUri.Trim;
+  const HasResult = (Result <> '');
+  if HasResult then
+    Exit;
+
+  Result := Format('%s://%s:%d%s', [FSettings.Protocol.ToLower, FSettings.Host.ToLower, FPort, FSettings.Endpoint]);
+end;
+
+function TMCPIdHTTPServer.ResourceMetadataUrl: string;
+begin
+  Result := '';
+  if not Assigned(FSettings) or (Length(FSettings.AuthorizationServerList) = 0) then
+    Exit;
+
+  const PublicResourceUri = ConfiguredResourceUri;
+  const PublicMetadataUrl = TMCPProtectedResourceMetadata.UrlFor(PublicResourceUri);
+  const HasPublicMetadataUrl = (PublicMetadataUrl <> '');
+  if HasPublicMetadataUrl then
+    Exit(PublicMetadataUrl);
+
+  Result := Format('%s://%s:%d%s%s', [FSettings.Protocol.ToLower, FSettings.Host.ToLower, FPort,
+    TMCPProtectedResourceMetadata.WELL_KNOWN_PATH, FSettings.Endpoint]);
+end;
+
+procedure TMCPIdHTTPServer.HandleProtectedResourceMetadata(ResponseInfo: TIdHTTPResponseInfo);
+begin
+  var Metadata := TMCPProtectedResourceMetadata.Build(ResourceUri, FSettings.ServerName,
+    FSettings.AuthorizationServerList, FSettings.ScopesSupportedList);
+  try
+    ResponseInfo.CustomHeaders.Values['Cache-Control'] := METADATA_CACHE_CONTROL;
+    SendJson(ResponseInfo, HTTP_STATUS_OK, Metadata.ToJSON);
+  finally
+    Metadata.Free;
+  end;
+end;
+
+procedure TMCPIdHTTPServer.SendChallenge(ResponseInfo: TIdHTTPResponseInfo; Status: Integer;
+  const Challenge: TMCPAuthChallenge; const Message: string);
+begin
+  ResponseInfo.CustomHeaders.Values[HEADER_WWW_AUTHENTICATE] := TMCPBearerChallenge.Build(ResourceMetadataUrl, Challenge);
+  SendJsonRpcError(ResponseInfo, Status, JSONRPC_INVALID_REQUEST, Message);
+end;
+
+function TMCPIdHTTPServer.TryAuthenticate(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+  out Principal: TMCPPrincipal): Boolean;
+begin
+  Principal := TMCPPrincipal.None;
   Result := False;
 
-  if not Assigned(FSettings) or (FSettings.OAuthTokenSecret = '') then
-    Exit;
-
-  Parts := Token.Split(['.']);
-  if Length(Parts) <> 3 then
+  const Header = HeaderValue(RequestInfo, HEADER_AUTHORIZATION);
+  const IsMissing = (Header = '');
+  if IsMissing then
   begin
-    TLogger.Warning('ValidateBearerToken: wrong number of parts: ' + IntToStr(Length(Parts)));
+    SendChallenge(ResponseInfo, HTTP_UNAUTHORIZED, TMCPAuthChallenge.None, 'Authorization required');
     Exit;
   end;
 
-  // Verify HMAC-SHA256 signature
-  SignInput    := Parts[0] + '.' + Parts[1];
-  KeyBytes     := TEncoding.UTF8.GetBytes(FSettings.OAuthTokenSecret);
-  ExpectedSig  := THashSHA2.GetHMACAsBytes(TEncoding.UTF8.GetBytes(SignInput), KeyBytes);
-  SigBytes     := Base64URLDecode(Parts[2]);
-
-  if (Length(SigBytes) = 0) or (Length(SigBytes) <> Length(ExpectedSig)) then
+  const IsBearer = (Header.StartsWith(BEARER_PREFIX, True) and (Header.Length > BEARER_PREFIX.Length));
+  if not IsBearer then
   begin
-    TLogger.Warning(Format('ValidateBearerToken: signature length mismatch: got %d, expected %d',
-      [Length(SigBytes), Length(ExpectedSig)]));
-    Exit;
-  end;
-  if not CompareMem(@SigBytes[0], @ExpectedSig[0], Length(ExpectedSig)) then
-  begin
-    TLogger.Warning('ValidateBearerToken: signature mismatch');
+    SendChallenge(ResponseInfo, HTTP_STATUS_BAD_REQUEST,
+      TMCPAuthChallenge.InvalidRequest('Only the Bearer scheme is supported'), 'Malformed Authorization header');
     Exit;
   end;
 
-  // Verify expiry claim
-  PayloadStr  := TEncoding.UTF8.GetString(Base64URLDecode(Parts[1]));
-  PayloadJSON := TJSONObject.ParseJSONValue(PayloadStr) as TJSONObject;
-  if not Assigned(PayloadJSON) then
-  begin
-    TLogger.Warning('ValidateBearerToken: could not parse payload');
-    Exit;
-  end;
-  try
-    var ExpVal := PayloadJSON.GetValue('exp');
-    if not Assigned(ExpVal) then
-    begin
-      TLogger.Warning('ValidateBearerToken: no exp claim');
-      Exit;
-    end;
-    ExpValue := StrToInt64(ExpVal.Value);
-    var NowUnix := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now));
-    if NowUnix > ExpValue then
-    begin
-      TLogger.Warning(Format('ValidateBearerToken: token expired (now=%d, exp=%d)', [NowUnix, ExpValue]));
-      Exit;
-    end;
-    TLogger.Info('ValidateBearerToken: token valid');
-    Result := True;
-  finally
-    PayloadJSON.Free;
-  end;
-end;
-
-function TMCPIdHTTPServer.GetParam(Params: TDictionary<string, string>; const Key: string): string;
-begin
-  if not Params.TryGetValue(Key, Result) then
-    Result := '';
-end;
-
-function TMCPIdHTTPServer.HTMLEncode(const S: string): string;
-begin
-  Result := S.Replace('&',  '&amp;',  [rfReplaceAll])
-             .Replace('<',  '&lt;',   [rfReplaceAll])
-             .Replace('>',  '&gt;',   [rfReplaceAll])
-             .Replace('"',  '&quot;', [rfReplaceAll])
-             .Replace('''', '&#39;',  [rfReplaceAll]);
-end;
-
-// ── OAuth endpoint handlers ──────────────────────────────────────────────────
-
-procedure TMCPIdHTTPServer.HandleWellKnownOAuth(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  Base: string;
-  Meta: TJSONObject;
-begin
-  Base := GetRequestBaseURL(RequestInfo);
-  Meta := TJSONObject.Create;
-  try
-    Meta.AddPair('issuer',                 Base);
-    Meta.AddPair('authorization_endpoint', Base + OAUTH_AUTHORIZE_PATH);
-    Meta.AddPair('token_endpoint',         Base + OAUTH_TOKEN_PATH);
-
-    var RespTypes := TJSONArray.Create;
-    RespTypes.Add('code');
-    Meta.AddPair('response_types_supported', RespTypes);
-
-    var GrantTypes := TJSONArray.Create;
-    GrantTypes.Add('authorization_code');
-    GrantTypes.Add('refresh_token');
-    Meta.AddPair('grant_types_supported', GrantTypes);
-
-    var ChallengeMethods := TJSONArray.Create;
-    ChallengeMethods.Add('S256');
-    Meta.AddPair('code_challenge_methods_supported', ChallengeMethods);
-
-    var AuthMethods := TJSONArray.Create;
-    AuthMethods.Add('none');
-    Meta.AddPair('token_endpoint_auth_methods_supported', AuthMethods);
-    Meta.AddPair('registration_endpoint', Base + OAUTH_REGISTER_PATH);
-
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.ContentText := Meta.ToJSON;
-    ResponseInfo.ResponseNo  := HTTP_OK;
-  finally
-    Meta.Free;
-  end;
-end;
-
-procedure TMCPIdHTTPServer.HandleProtectedResourceMetadata(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  Base: string;
-  Meta: TJSONObject;
-  AuthServers: TJSONArray;
-  BearerMethods: TJSONArray;
-begin
-  Base := GetRequestBaseURL(RequestInfo);
-  Meta := TJSONObject.Create;
-  try
-    Meta.AddPair('resource', Base + FSettings.Endpoint);
-    AuthServers := TJSONArray.Create;
-    AuthServers.Add(Base);
-    Meta.AddPair('authorization_servers', AuthServers);
-    BearerMethods := TJSONArray.Create;
-    BearerMethods.Add('header');
-    Meta.AddPair('bearer_methods_supported', BearerMethods);
-
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.ContentText := Meta.ToJSON;
-    ResponseInfo.ResponseNo  := HTTP_OK;
-  finally
-    Meta.Free;
-  end;
-end;
-
-procedure TMCPIdHTTPServer.HandleRegister(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  RequestJSON, ResponseJSON: TJSONObject;
-  Body: string;
-  ClientID: string;
-  RedirectURIs: TJSONValue;
-begin
-  // RFC 7591 dynamic client registration — accept any client, return a client_id
-  // Real auth is handled by the password form in /authorize, not client credentials
-  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
-
-  if RequestInfo.CommandType <> hcPOST then
-  begin
-    ResponseInfo.ResponseNo := HTTP_METHOD_NOT_ALLOWED;
-    Exit;
-  end;
-
-  Body := '';
-  if Assigned(RequestInfo.PostStream) and (RequestInfo.PostStream.Size > 0) then
-  begin
-    RequestInfo.PostStream.Position := 0;
-    Body := ReadStringFromStream(RequestInfo.PostStream, -1, IndyTextEncoding_UTF8);
-  end;
-
-  ClientID := GenerateAuthCode; // reuse GUID generator for a unique client_id
-
-  ResponseJSON := TJSONObject.Create;
-  try
-    ResponseJSON.AddPair('client_id', ClientID);
-    ResponseJSON.AddPair('client_id_issued_at', TJSONNumber.Create(
-      DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now))));
-    ResponseJSON.AddPair('token_endpoint_auth_method', 'none');
-
-    // Echo back redirect_uris and grant_types from the request if present
-    RequestJSON := TJSONObject.ParseJSONValue(Body) as TJSONObject;
-    if Assigned(RequestJSON) then
-    try
-      RedirectURIs := RequestJSON.GetValue('redirect_uris');
-      if Assigned(RedirectURIs) then
-        ResponseJSON.AddPair('redirect_uris', RedirectURIs.Clone as TJSONValue);
-      var GrantTypes := RequestJSON.GetValue('grant_types');
-      if Assigned(GrantTypes) then
-        ResponseJSON.AddPair('grant_types', GrantTypes.Clone as TJSONValue);
-    finally
-      RequestJSON.Free;
-    end;
-
-    ResponseInfo.ResponseNo  := 201;
-    ResponseInfo.ResponseText := 'Created';
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
-    ResponseInfo.ContentText := ResponseJSON.ToJSON;
-    TLogger.Info('OAuth: registered client_id=' + ClientID);
-  finally
-    ResponseJSON.Free;
-  end;
-end;
-
-procedure TMCPIdHTTPServer.HandleAuthorize(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  Params: TDictionary<string, string>;
-  ClientID, RedirectURI, CodeChallenge, State, Password: string;
-  Entry: TAuthCodeEntry;
-  AuthCode, Location: string;
-begin
-  if RequestInfo.CommandType = hcGET then
-  begin
-    Params := ParseFormParams(RequestInfo.QueryParams);
-    try
-      ClientID      := GetParam(Params, 'client_id');
-      RedirectURI   := GetParam(Params, 'redirect_uri');
-      CodeChallenge := GetParam(Params, 'code_challenge');
-      State         := GetParam(Params, 'state');
-    finally
-      Params.Free;
-    end;
-
-    if (RedirectURI = '') or (CodeChallenge = '') then
-    begin
-      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-      ResponseInfo.ContentText := 'Missing required parameters: redirect_uri and code_challenge';
-      Exit;
-    end;
-
-    ResponseInfo.ContentType := 'text/html; charset=utf-8';
-    ResponseInfo.ContentText := Format(AUTH_FORM_HTML, ['',
-      HTMLEncode(ClientID), HTMLEncode(RedirectURI),
-      HTMLEncode(CodeChallenge), HTMLEncode(State)]);
-    ResponseInfo.ResponseNo := HTTP_OK;
-  end
-  else if RequestInfo.CommandType = hcPOST then
-  begin
-    var Body := RequestInfo.FormParams;
-    if (Body = '') and Assigned(RequestInfo.PostStream) and (RequestInfo.PostStream.Size > 0) then
-    begin
-      RequestInfo.PostStream.Position := 0;
-      Body := ReadStringFromStream(RequestInfo.PostStream, -1, IndyTextEncoding_UTF8);
-    end;
-
-    Params := ParseFormParams(Body);
-    try
-      ClientID      := GetParam(Params, 'client_id');
-      RedirectURI   := GetParam(Params, 'redirect_uri');
-      CodeChallenge := GetParam(Params, 'code_challenge');
-      State         := GetParam(Params, 'state');
-      Password      := GetParam(Params, 'password');
-    finally
-      Params.Free;
-    end;
-
-    TLogger.Info(Format('OAuth: password check - received %d chars, stored %d chars, body %d chars',
-      [Length(Password), Length(FSettings.OAuthPassword), Length(Body)]));
-
-    if Password <> FSettings.OAuthPassword then
-    begin
-      ResponseInfo.ContentType := 'text/html; charset=utf-8';
-      ResponseInfo.ContentText := Format(AUTH_FORM_HTML,
-        ['<p class="err">Incorrect password. Please try again.</p>',
-         HTMLEncode(ClientID), HTMLEncode(RedirectURI),
-         HTMLEncode(CodeChallenge), HTMLEncode(State)]);
-      ResponseInfo.ResponseNo := HTTP_OK;
-      TLogger.Warning('Failed OAuth login attempt from: ' + RequestInfo.RemoteIP);
-      Exit;
-    end;
-
-    AuthCode := GenerateAuthCode;
-    Entry.CodeChallenge := CodeChallenge;
-    Entry.RedirectURI   := RedirectURI;
-    Entry.State         := State;
-    Entry.ExpiresAt     := Now + AUTH_CODE_LIFETIME;
-
-    FAuthCodesLock.Enter;
-    try
-      CleanExpiredAuthCodes;
-      FAuthCodes.AddOrSetValue(AuthCode, Entry);
-    finally
-      FAuthCodesLock.Leave;
-    end;
-
-    Location := RedirectURI + '?code=' + AuthCode;
-    if State <> '' then
-      Location := Location + '&state=' + TIdURI.ParamsEncode(State);
-
-    ResponseInfo.ResponseNo   := HTTP_FOUND;
-    ResponseInfo.ResponseText := 'Found';
-    ResponseInfo.CustomHeaders.Values['Location'] := Location;
-    TLogger.Info('OAuth: issued auth code for client_id=' + ClientID);
-  end
+  const Token = Header.Substring(BEARER_PREFIX.Length).Trim;
+  const Outcome = FAuthorizer.Authorize(Token, RequestInfo.Command, RequestInfo.Document);
+  Principal := Outcome.Principal;
+  case Outcome.Decision of
+    TMCPAuthDecision.Allow:
+      Result := True;
+    TMCPAuthDecision.Unauthorized:
+      SendChallenge(ResponseInfo, HTTP_UNAUTHORIZED, Outcome.Challenge, 'Unauthorized');
+    TMCPAuthDecision.Forbidden:
+      SendChallenge(ResponseInfo, HTTP_FORBIDDEN, Outcome.Challenge, 'Forbidden');
+    TMCPAuthDecision.BadRequest:
+      SendChallenge(ResponseInfo, HTTP_STATUS_BAD_REQUEST, Outcome.Challenge, 'Malformed authorization request');
   else
-    ResponseInfo.ResponseNo := HTTP_METHOD_NOT_ALLOWED;
+    SendChallenge(ResponseInfo, HTTP_UNAUTHORIZED, Outcome.Challenge, 'Unauthorized');
+  end;
 end;
 
-procedure TMCPIdHTTPServer.HandleToken(RequestInfo: TIdHTTPRequestInfo;
-  ResponseInfo: TIdHTTPResponseInfo);
-var
-  Body: string;
-  Params: TDictionary<string, string>;
-  Code, CodeVerifier, GrantType, OldRefreshToken: string;
-  AuthEntry: TAuthCodeEntry;
-  RefreshEntry: TRefreshTokenEntry;
-  ComputedChallenge: string;
-  TokenJSON: TJSONObject;
-  NewRefreshToken: string;
-  RefreshFound: Boolean;
+function TMCPIdHTTPServer.BuildTransportHints(RequestInfo: TIdHTTPRequestInfo): TMCPTransportHints;
 begin
-  // Token endpoint always allows any origin so clients can call it cross-origin
-  ResponseInfo.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
+  Result := TMCPTransportHints.ForHttp(
+    HeaderPresent(RequestInfo, MCP_HEADER_PROTOCOL_VERSION), HeaderValue(RequestInfo, MCP_HEADER_PROTOCOL_VERSION));
+  Result.HasMethodHeader := HeaderPresent(RequestInfo, MCP_HEADER_METHOD);
+  Result.MethodHeader := HeaderValue(RequestInfo, MCP_HEADER_METHOD);
+  Result.HasNameHeader := HeaderPresent(RequestInfo, MCP_HEADER_NAME);
+  Result.NameHeader := HeaderValue(RequestInfo, MCP_HEADER_NAME);
+  Result.RemoteAddress := RequestInfo.RemoteIP;
+end;
 
-  if RequestInfo.CommandType <> hcPOST then
+procedure TMCPIdHTTPServer.EchoLegacySessionId(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo);
+begin
+  var SessionId := HeaderValue(RequestInfo, MCP_HEADER_SESSION_ID);
+  if (SessionId <> '') and TMCPHeaderValue.IsHeaderSafe(SessionId) and not SessionId.Contains(' ') then
+    ResponseInfo.CustomHeaders.Values[MCP_HEADER_SESSION_ID] := SessionId;
+end;
+
+procedure TMCPIdHTTPServer.HandlePostRequest(Context: TIdContext; RequestInfo: TIdHTTPRequestInfo;
+  ResponseInfo: TIdHTTPResponseInfo; const Principal: TMCPPrincipal);
+begin
+  const RequestBody = ReadBody(RequestInfo);
+  TLogger.Debug('Request: ' + TLogger.RedactJson(RequestBody));
+  if not IsBodyWithinLimits(RequestInfo, ResponseInfo, RequestBody) then
+    Exit;
+
+  const AcceptsEventStream = TMCPAcceptHeader.Accepts(HeaderValue(RequestInfo, HEADER_ACCEPT), MEDIA_TYPE_EVENT_STREAM);
+  var Hints := BuildTransportHints(RequestInfo);
+  Hints.Principal := Principal.Subject;
+  Hints.Scopes := Principal.Scopes;
+
+  var Stream: TMCPHttpResponseStream := nil;
+  var StreamRef: IMCPMessageSink := nil;
+  if AcceptsEventStream then
   begin
-    ResponseInfo.ResponseNo := HTTP_METHOD_NOT_ALLOWED;
+    Stream := TMCPHttpResponseStream.Create(Context, ResponseInfo);
+    StreamRef := Stream;
+    Hints.Sink := Stream;
+    Hints.Tracker := Stream;
+  end;
+
+  var Outcome: TMCPProcessResult;
+  const Message = TJSONObject.ParseJSONValue(RequestBody);
+  try
+    Outcome := FJsonRpcProcessor.ProcessRequestEx(Message, Hints);
+  finally
+    Message.Free;
+  end;
+
+  const IsStreamed = (Assigned(Stream) and Stream.Opened);
+  if IsStreamed then
+  begin
+    TLogger.Debug('Response (streamed): ' + TLogger.RedactJson(Outcome.Body));
+    Stream.Finish(Outcome.Body);
     Exit;
   end;
 
-  Body := RequestInfo.FormParams;
-  if (Body = '') and Assigned(RequestInfo.PostStream) and (RequestInfo.PostStream.Size > 0) then
-  begin
-    RequestInfo.PostStream.Position := 0;
-    Body := ReadStringFromStream(RequestInfo.PostStream, -1, IndyTextEncoding_UTF8);
-  end;
-
-  Params := ParseFormParams(Body);
-  try
-    GrantType       := GetParam(Params, 'grant_type');
-    Code            := GetParam(Params, 'code');
-    CodeVerifier    := GetParam(Params, 'code_verifier');
-    OldRefreshToken := GetParam(Params, 'refresh_token');
-  finally
-    Params.Free;
-  end;
-
-  TLogger.Info(Format('OAuth /token request: grant_type=%s, code len=%d, verifier len=%d, refresh_token len=%d',
-    [GrantType, Length(Code), Length(CodeVerifier), Length(OldRefreshToken)]));
-
-  if GrantType = 'authorization_code' then
-  begin
-    // Validate auth code and PKCE
-    FAuthCodesLock.Enter;
-    try
-      if not FAuthCodes.TryGetValue(Code, AuthEntry) then
-      begin
-        TLogger.Warning('OAuth /token: REJECTED - auth code not found in store ' +
-          Format('(received code len=%d, %d code(s) currently stored)', [Length(Code), FAuthCodes.Count]));
-        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-        ResponseInfo.ContentType := 'application/json';
-        ResponseInfo.ContentText := '{"error":"invalid_grant"}';
-        Exit;
-      end;
-
-      if Now > AuthEntry.ExpiresAt then
-      begin
-        TLogger.Warning('OAuth /token: REJECTED - auth code expired');
-        FAuthCodes.Remove(Code);
-        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-        ResponseInfo.ContentType := 'application/json';
-        ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"Code expired"}';
-        Exit;
-      end;
-
-      // Verify PKCE: BASE64URL(SHA256(code_verifier)) must equal the stored code_challenge
-      ComputedChallenge := Base64URLEncode(THashSHA2.GetHashBytes(CodeVerifier));
-
-      if ComputedChallenge <> AuthEntry.CodeChallenge then
-      begin
-        TLogger.Warning(Format('OAuth /token: REJECTED - PKCE mismatch (computed=%s expected=%s)',
-          [ComputedChallenge, AuthEntry.CodeChallenge]));
-        ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-        ResponseInfo.ContentType := 'application/json';
-        ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"PKCE verification failed"}';
-        Exit;
-      end;
-
-      FAuthCodes.Remove(Code); // one-time use
-    finally
-      FAuthCodesLock.Leave;
-    end;
-
-    // Issue refresh token alongside access token
-    NewRefreshToken        := GenerateRefreshToken;
-    RefreshEntry.IssuedAt  := Now;
-    RefreshEntry.ExpiresAt := Now + FSettings.OAuthRefreshTokenExpiry * (1.0 / 86400.0);
-
-    FRefreshTokensLock.Enter;
-    try
-      CleanExpiredRefreshTokens;
-      FRefreshTokens.AddOrSetValue(NewRefreshToken, RefreshEntry);
-    finally
-      FRefreshTokensLock.Leave;
-    end;
-    SaveRefreshTokens;
-
-    TokenJSON := TJSONObject.Create;
-    try
-      TokenJSON.AddPair('access_token',  GenerateJWT);
-      TokenJSON.AddPair('token_type',    'bearer');
-      TokenJSON.AddPair('expires_in',    TJSONNumber.Create(FSettings.OAuthTokenExpiry));
-      TokenJSON.AddPair('refresh_token', NewRefreshToken);
-
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
-      ResponseInfo.ContentText := TokenJSON.ToJSON;
-      ResponseInfo.ResponseNo  := HTTP_OK;
-      TLogger.Info('OAuth: issued access token and refresh token');
-    finally
-      TokenJSON.Free;
-    end;
-  end
-  else if GrantType = 'refresh_token' then
-  begin
-    // Validate incoming refresh token — consume it immediately (rotation)
-    RefreshFound := False;
-
-    FRefreshTokensLock.Enter;
-    try
-      if FRefreshTokens.TryGetValue(OldRefreshToken, RefreshEntry) then
-      begin
-        FRefreshTokens.Remove(OldRefreshToken); // consume regardless — rotation or expired
-        RefreshFound := Now <= RefreshEntry.ExpiresAt;
-      end;
-    finally
-      FRefreshTokensLock.Leave;
-    end;
-
-    if not RefreshFound then
-    begin
-      ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.ContentText := '{"error":"invalid_grant","error_description":"Invalid or expired refresh token"}';
-      TLogger.Warning('OAuth: rejected invalid/expired refresh token from: ' + RequestInfo.RemoteIP);
-      Exit;
-    end;
-
-    // Issue new access token and rotated refresh token
-    NewRefreshToken        := GenerateRefreshToken;
-    RefreshEntry.IssuedAt  := Now;
-    RefreshEntry.ExpiresAt := Now + FSettings.OAuthRefreshTokenExpiry * (1.0 / 86400.0);
-
-    FRefreshTokensLock.Enter;
-    try
-      CleanExpiredRefreshTokens;
-      FRefreshTokens.AddOrSetValue(NewRefreshToken, RefreshEntry);
-    finally
-      FRefreshTokensLock.Leave;
-    end;
-    SaveRefreshTokens;
-
-    TokenJSON := TJSONObject.Create;
-    try
-      TokenJSON.AddPair('access_token',  GenerateJWT);
-      TokenJSON.AddPair('token_type',    'bearer');
-      TokenJSON.AddPair('expires_in',    TJSONNumber.Create(FSettings.OAuthTokenExpiry));
-      TokenJSON.AddPair('refresh_token', NewRefreshToken);
-
-      ResponseInfo.ContentType := 'application/json';
-      ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-store';
-      ResponseInfo.ContentText := TokenJSON.ToJSON;
-      ResponseInfo.ResponseNo  := HTTP_OK;
-      TLogger.Info('OAuth: refreshed access token (rotated refresh token)');
-    finally
-      TokenJSON.Free;
-    end;
-  end
-  else
-  begin
-    TLogger.Warning('OAuth /token: REJECTED - unsupported grant_type "' + GrantType + '"');
-    ResponseInfo.ResponseNo  := HTTP_BAD_REQUEST;
-    ResponseInfo.ContentType := 'application/json';
-    ResponseInfo.ContentText := '{"error":"unsupported_grant_type"}';
-  end;
+  SendOutcome(RequestInfo, ResponseInfo, Outcome, AcceptsEventStream);
 end;
 
-// ── Refresh token helpers ────────────────────────────────────────────────────
-
-function TMCPIdHTTPServer.GenerateRefreshToken: string;
-var
-  G1, G2: TGUID;
+function TMCPIdHTTPServer.MaxJsonDepth: Integer;
 begin
-  // Two GUIDs concatenated = 256 bits of randomness
-  CreateGUID(G1);
-  CreateGUID(G2);
-  Result := (GUIDToString(G1) + GUIDToString(G2))
-    .Replace('{', '', [rfReplaceAll])
-    .Replace('}', '', [rfReplaceAll])
-    .Replace('-', '', [rfReplaceAll])
-    .ToLower;
-end;
-
-procedure TMCPIdHTTPServer.CleanExpiredRefreshTokens;
-var
-  Expired: TList<string>;
-begin
-  // Caller must hold FRefreshTokensLock
-  Expired := TList<string>.Create;
-  try
-    for var Pair in FRefreshTokens do
-      if Now > Pair.Value.ExpiresAt then
-        Expired.Add(Pair.Key);
-    for var Key in Expired do
-      FRefreshTokens.Remove(Key);
-  finally
-    Expired.Free;
-  end;
-end;
-
-function TMCPIdHTTPServer.GetRefreshTokensFilePath: string;
-begin
+  Result := TMCPSettings.DEFAULT_MAX_JSON_DEPTH;
   if Assigned(FSettings) then
-    Result := TPath.Combine(TPath.GetDirectoryName(FSettings.SettingsFile), 'refresh_tokens.json')
-  else
-    Result := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)), 'refresh_tokens.json');
+    Result := FSettings.MaxJsonDepth;
 end;
 
-procedure TMCPIdHTTPServer.SaveRefreshTokens;
-var
-  Wrapper: TJSONObject;
-  TokensArr: TJSONArray;
-  TokenEntry: TJSONObject;
-  FilePath: string;
+function TMCPIdHTTPServer.ReadBody(RequestInfo: TIdHTTPRequestInfo): string;
 begin
-  FilePath  := GetRefreshTokensFilePath;
-  Wrapper   := TJSONObject.Create;
-  TokensArr := TJSONArray.Create;
-  try
-    Wrapper.AddPair('refresh_tokens', TokensArr); // Wrapper takes ownership
-
-    FRefreshTokensLock.Enter;
-    try
-      CleanExpiredRefreshTokens;
-      for var Pair in FRefreshTokens do
-      begin
-        TokenEntry := TJSONObject.Create;
-        TokenEntry.AddPair('token',      Pair.Key);
-        TokenEntry.AddPair('issued_at',  TJSONNumber.Create(
-          DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Pair.Value.IssuedAt))));
-        TokenEntry.AddPair('expires_at', TJSONNumber.Create(
-          DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Pair.Value.ExpiresAt))));
-        TokensArr.AddElement(TokenEntry);
-      end;
-    finally
-      FRefreshTokensLock.Leave;
-    end;
-
-    TFile.WriteAllText(FilePath, Wrapper.ToJSON, TEncoding.UTF8);
-    TLogger.Info(Format('OAuth: saved %d refresh token(s)', [TokensArr.Count]));
-  finally
-    Wrapper.Free; // also frees TokensArr and all entries
-  end;
-end;
-
-procedure TMCPIdHTTPServer.LoadRefreshTokens;
-var
-  FilePath, JSON: string;
-  Root: TJSONObject;
-  TokensArr: TJSONArray;
-  Item: TJSONObject;
-  Entry: TRefreshTokenEntry;
-  TokenVal, IssuedVal, ExpiresVal: TJSONValue;
-  Loaded: Integer;
-begin
-  FilePath := GetRefreshTokensFilePath;
-  if not TFile.Exists(FilePath) then
+  Result := '';
+  const HasBody = (Assigned(RequestInfo.PostStream) and (RequestInfo.PostStream.Size > 0));
+  if not HasBody then
     Exit;
 
-  try
-    JSON := TFile.ReadAllText(FilePath, TEncoding.UTF8);
-    Root := TJSONObject.ParseJSONValue(JSON) as TJSONObject;
-    if not Assigned(Root) then
-      Exit;
-    try
-      TokensArr := Root.GetValue('refresh_tokens') as TJSONArray;
-      if not Assigned(TokensArr) then
-        Exit;
+  RequestInfo.PostStream.Position := 0;
+  Result := ReadStringFromStream(RequestInfo.PostStream, -1, IndyTextEncoding_UTF8);
+end;
 
-      Loaded := 0;
-      FRefreshTokensLock.Enter;
-      try
-        for var I := 0 to TokensArr.Count - 1 do
-        begin
-          Item := TokensArr.Items[I] as TJSONObject;
-          if not Assigned(Item) then
-            Continue;
-
-          TokenVal   := Item.GetValue('token');
-          IssuedVal  := Item.GetValue('issued_at');
-          ExpiresVal := Item.GetValue('expires_at');
-          if not Assigned(TokenVal) or not Assigned(IssuedVal) or not Assigned(ExpiresVal) then
-            Continue;
-
-          Entry.IssuedAt  := TTimeZone.Local.ToLocalTime(
-            UnixToDateTime(StrToInt64(IssuedVal.Value)));
-          Entry.ExpiresAt := TTimeZone.Local.ToLocalTime(
-            UnixToDateTime(StrToInt64(ExpiresVal.Value)));
-
-          if Now < Entry.ExpiresAt then
-          begin
-            FRefreshTokens.AddOrSetValue(TokenVal.Value, Entry);
-            Inc(Loaded);
-          end;
-        end;
-      finally
-        FRefreshTokensLock.Leave;
-      end;
-
-      TLogger.Info(Format('OAuth: loaded %d refresh token(s) from %s', [Loaded, FilePath]));
-    finally
-      Root.Free;
-    end;
-  except
-    on E: Exception do
-      TLogger.Warning('OAuth: failed to load refresh tokens: ' + E.Message);
+function TMCPIdHTTPServer.IsBodyWithinLimits(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+  const Body: string): Boolean;
+begin
+  const Limit = MaxBodyBytes;
+  const IsTooLarge = Assigned(RequestInfo.PostStream) and
+    ((RequestInfo.PostStream is TMCPDiscardedBody) or (RequestInfo.PostStream.Size > Limit));
+  if IsTooLarge then
+  begin
+    SendJsonRpcError(ResponseInfo, HTTP_PAYLOAD_TOO_LARGE, JSONRPC_INVALID_REQUEST,
+      Format('Request body exceeds %d bytes', [Limit]));
+    Exit(False);
   end;
+
+  const Depth = MaxJsonDepth;
+  const IsTooDeep = (TMCPJsonLimits.NestingDepth(Body) > Depth);
+  if IsTooDeep then
+  begin
+    SendJsonRpcError(ResponseInfo, HTTP_STATUS_BAD_REQUEST, JSONRPC_PARSE_ERROR,
+      Format('JSON nesting exceeds %d levels', [Depth]));
+    Exit(False);
+  end;
+  Result := True;
+end;
+
+procedure TMCPIdHTTPServer.SendOutcome(RequestInfo: TIdHTTPRequestInfo; ResponseInfo: TIdHTTPResponseInfo;
+  const Outcome: TMCPProcessResult; const AcceptsEventStream: Boolean);
+begin
+  if Outcome.Era = TMCPProtocolEra.Legacy then
+    EchoLegacySessionId(RequestInfo, ResponseInfo);
+  const HasRequiredScope = (Outcome.RequiredScope <> '');
+  if HasRequiredScope then
+    ResponseInfo.CustomHeaders.Values[HEADER_WWW_AUTHENTICATE] :=
+      TMCPBearerChallenge.Build(ResourceMetadataUrl, TMCPAuthChallenge.InsufficientScope(Outcome.RequiredScope));
+
+  const IsEmpty = (Outcome.Body = '');
+  if IsEmpty then
+  begin
+    SendEmpty(ResponseInfo, Outcome.HttpStatus);
+    Exit;
+  end;
+
+  TLogger.Debug('Response: ' + TLogger.RedactJson(Outcome.Body));
+
+  const AsEventStream = ((Outcome.HttpStatus = HTTP_STATUS_OK) and AcceptsEventStream);
+  if AsEventStream then
+    SendSse(ResponseInfo, Outcome.Body)
+  else
+    SendJson(ResponseInfo, Outcome.HttpStatus, Outcome.Body);
+end;
+
+procedure TMCPIdHTTPServer.SendEmpty(ResponseInfo: TIdHTTPResponseInfo; Status: Integer);
+begin
+  ResponseInfo.ResponseNo := Status;
+  ResponseInfo.ContentStream := TMemoryStream.Create;
+  ResponseInfo.FreeContentStream := True;
+end;
+
+procedure TMCPIdHTTPServer.SendJson(ResponseInfo: TIdHTTPResponseInfo; Status: Integer; const Body: string);
+begin
+  ResponseInfo.ResponseNo := Status;
+  ResponseInfo.ContentType := MEDIA_TYPE_JSON;
+  ResponseInfo.ContentStream := TStringStream.Create(Body, TEncoding.UTF8);
+  ResponseInfo.FreeContentStream := True;
+end;
+
+procedure TMCPIdHTTPServer.SendSse(ResponseInfo: TIdHTTPResponseInfo; const Body: string);
+begin
+  ResponseInfo.ResponseNo := HTTP_STATUS_OK;
+  ResponseInfo.ContentType := MEDIA_TYPE_EVENT_STREAM;
+  ResponseInfo.CharSet := CHARSET_UTF8;
+  ResponseInfo.CustomHeaders.Values['Cache-Control'] := 'no-cache';
+  ResponseInfo.CustomHeaders.Values['X-Accel-Buffering'] := 'no';
+  ResponseInfo.ContentStream := TStringStream.Create(TMCPHttpResponseStream.EventText(Body), TEncoding.UTF8);
+  ResponseInfo.FreeContentStream := True;
+end;
+
+procedure TMCPIdHTTPServer.SendJsonRpcError(ResponseInfo: TIdHTTPResponseInfo; Status, Code: Integer; const Message: string);
+begin
+  var Response := TJSONObject.Create;
+  try
+    Response.AddPair(MCP_KEY_JSONRPC, '2.0');
+    var Error := TJSONObject.Create;
+    Response.AddPair(MCP_KEY_ERROR, Error);
+    Error.AddPair('code', TJSONNumber.Create(Code));
+    Error.AddPair('message', Message);
+    SendJson(ResponseInfo, Status, Response.ToJSON);
+  finally
+    Response.Free;
+  end;
+end;
+
+procedure TMCPIdHTTPServer.SendMethodNotAllowed(ResponseInfo: TIdHTTPResponseInfo);
+begin
+  ResponseInfo.CustomHeaders.Values['Allow'] := ALLOW_HEADER;
+  SendEmpty(ResponseInfo, HTTP_METHOD_NOT_ALLOWED);
 end;
 
 end.

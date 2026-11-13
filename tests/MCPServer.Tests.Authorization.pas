@@ -1,0 +1,368 @@
+unit MCPServer.Tests.Authorization;
+
+interface
+
+uses
+  DUnitX.TestFramework,
+  System.SysUtils,
+  System.Classes,
+  System.JSON,
+  IdHTTPServer,
+  IdContext,
+  IdCustomHTTPServer,
+  MCPServer.Types,
+  MCPServer.Authorization;
+
+type
+  TClaimsAuthorizer = class(TMCPOAuthResourceServerAuthorizer)
+  strict private
+    FClaimsJson: string;
+  protected
+    function TryValidateToken(const Token: string; out Claims: TJSONObject): Boolean; override;
+  public
+    constructor Create(const ExpectedAudience, ClaimsJson: string);
+  end;
+
+  [TestFixture]
+  TAuthorizationTests = class
+  private
+    FIntrospection: TIdHTTPServer;
+    FSeenAuthorization: string;
+    FSeenBody: string;
+    procedure HandleIntrospection(Context: TIdContext; Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo);
+    function Decide(const Authorizer: IMCPAuthorizer; const Token: string): TMCPAuthResult;
+    procedure StartIntrospectionServer;
+    function IntrospectionUrl: string;
+  public
+    [TearDown]
+    procedure TearDown;
+
+    [Test]
+    procedure StaticBearer_AcceptsListedTokens_RejectsOthers;
+
+    [Test]
+    procedure StaticBearer_NeedsAToken;
+
+    [Test]
+    procedure ConstantTime_ComparesWholeToken;
+
+    [Test]
+    procedure Principal_HasScope_HonoursWildcard;
+
+    [Test]
+    procedure OAuth_RejectsWrongAudience_Expiry_AndScope;
+
+    [Test]
+    procedure OAuth_AcceptsAudienceArray_AndScopeArray;
+
+    [Test]
+    procedure OAuth_NeedsAnAudience;
+
+    [Test]
+    procedure Challenge_Build_QuotesParameters;
+
+    [Test]
+    procedure Metadata_Build_DropsOfflineAccess;
+
+    [Test]
+    [TestCase('Path', 'https://catalog.example/mcp,https://catalog.example/.well-known/oauth-protected-resource/mcp')]
+    [TestCase('PortAndNestedPath', 'https://catalog.example:8443/tenant/mcp,https://catalog.example:8443/.well-known/oauth-protected-resource/tenant/mcp')]
+    [TestCase('NoPath', 'https://catalog.example,https://catalog.example/.well-known/oauth-protected-resource')]
+    [TestCase('TrailingSlash', 'https://catalog.example/,https://catalog.example/.well-known/oauth-protected-resource')]
+    [TestCase('QueryAndFragment', 'https://catalog.example/mcp?x=1#f,https://catalog.example/.well-known/oauth-protected-resource/mcp')]
+    [TestCase('NotAUrl', 'not a url,')]
+    [TestCase('NoAuthority', 'https:///mcp,')]
+    procedure Metadata_UrlFor_InsertsWellKnownBeforeResourcePath(const ResourceUri: string; const Expected: string);
+
+    [Test]
+    [TestCase('NestedPath', 'https://catalog.example/tenant/mcp,/.well-known/oauth-protected-resource/tenant/mcp')]
+    [TestCase('NoPath', 'https://catalog.example,/.well-known/oauth-protected-resource')]
+    [TestCase('NotAUrl', 'not a url,')]
+    procedure Metadata_PathFor_InsertsWellKnownBeforeResourcePath(const ResourceUri: string; const Expected: string);
+
+    [Test]
+    procedure Introspection_PostsTokenWithClientCredentials;
+
+    [Test]
+    procedure Introspection_LongClientSecret_SendsBasicHeaderOnOneLine;
+  end;
+
+implementation
+
+uses
+  System.DateUtils;
+
+const
+  Audience = 'https://mcp.example/mcp';
+  ClaimsWithExpiryFormat = '{"sub":"u","aud":"%s","exp":%d}';
+  IntrospectionClientId = 'mcp';
+  ActiveToken = 'good';
+  LongSecretLength = 64;
+  LongSecretAuthorization =
+    'Basic bWNwOnh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=';
+
+{ TClaimsAuthorizer }
+
+constructor TClaimsAuthorizer.Create(const ExpectedAudience, ClaimsJson: string);
+begin
+  inherited Create(ExpectedAudience);
+  FClaimsJson := ClaimsJson;
+end;
+
+function TClaimsAuthorizer.TryValidateToken(const Token: string; out Claims: TJSONObject): Boolean;
+begin
+  Claims := nil;
+  if Token <> 'valid' then
+    Exit(False);
+  Claims := TJSONObject.ParseJSONValue(FClaimsJson) as TJSONObject;
+  Result := True;
+end;
+
+{ TAuthorizationTests }
+
+procedure TAuthorizationTests.TearDown;
+begin
+  FIntrospection.Free;
+  FIntrospection := nil;
+end;
+
+function TAuthorizationTests.Decide(const Authorizer: IMCPAuthorizer; const Token: string): TMCPAuthResult;
+begin
+  Result := Authorizer.Authorize(Token, 'POST', '/mcp');
+end;
+
+procedure TAuthorizationTests.StaticBearer_AcceptsListedTokens_RejectsOthers;
+begin
+  var Authorizer: IMCPAuthorizer := TMCPStaticBearerAuthorizer.Create(['alpha', ' beta ']);
+  var First := Decide(Authorizer, 'alpha');
+  Assert.AreEqual(TMCPAuthDecision.Allow, First.Decision);
+  Assert.AreEqual('token-1', First.Principal.Subject);
+  Assert.IsTrue(First.Principal.HasScope('anything'), 'pre-shared tokens grant every scope');
+
+  var Second := Decide(Authorizer, 'beta');
+  Assert.AreEqual(TMCPAuthDecision.Allow, Second.Decision);
+  Assert.AreEqual('token-2', Second.Principal.Subject);
+
+  var Unknown := Decide(Authorizer, 'alph');
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Unknown.Decision);
+  Assert.AreEqual('invalid_token', Unknown.Challenge.Error);
+  Assert.AreEqual('', Unknown.Principal.Subject);
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Decide(Authorizer, '').Decision);
+
+  var Scoped: IMCPAuthorizer := TMCPStaticBearerAuthorizer.Create(['alpha'], ['read']);
+  var Limited := Decide(Scoped, 'alpha');
+  Assert.AreEqual(TMCPAuthDecision.Allow, Limited.Decision);
+  Assert.IsTrue(Limited.Principal.HasScope('read'));
+  Assert.IsFalse(Limited.Principal.HasScope('write'));
+end;
+
+procedure TAuthorizationTests.StaticBearer_NeedsAToken;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TMCPStaticBearerAuthorizer.Create(['', '  ']).Free;
+    end, EMCPAuthorizationConfiguration);
+end;
+
+procedure TAuthorizationTests.ConstantTime_ComparesWholeToken;
+begin
+  Assert.IsTrue(TMCPConstantTime.SameBytes(TEncoding.UTF8.GetBytes('secret'), TEncoding.UTF8.GetBytes('secret')));
+  Assert.IsFalse(TMCPConstantTime.SameBytes(TEncoding.UTF8.GetBytes('secret'), TEncoding.UTF8.GetBytes('secret2')));
+  Assert.IsFalse(TMCPConstantTime.SameBytes(TEncoding.UTF8.GetBytes('secret'), TEncoding.UTF8.GetBytes('secreT')));
+  Assert.IsFalse(TMCPConstantTime.SameBytes(nil, TEncoding.UTF8.GetBytes('x')));
+  Assert.IsTrue(TMCPConstantTime.SameBytes(nil, nil));
+end;
+
+procedure TAuthorizationTests.Principal_HasScope_HonoursWildcard;
+begin
+  var Principal := TMCPPrincipal.None;
+  Assert.IsFalse(Principal.HasScope('read'));
+  Principal.Scopes := ['read', 'files:write'];
+  Assert.IsTrue(Principal.HasScope('files:write'));
+  Assert.IsFalse(Principal.HasScope('admin'));
+  Principal.Scopes := ['*'];
+  Assert.IsTrue(Principal.HasScope('admin'));
+end;
+
+procedure TAuthorizationTests.OAuth_RejectsWrongAudience_Expiry_AndScope;
+begin
+  var Future := System.DateUtils.DateTimeToUnix(Now, False) + 600;
+  var Past := System.DateUtils.DateTimeToUnix(Now, False) - 600;
+
+  const InvalidClaims = Format(ClaimsWithExpiryFormat, [Audience, Future]);
+  const Invalid: IMCPAuthorizer = TClaimsAuthorizer.Create(Audience, InvalidClaims);
+  var Rejected := Decide(Invalid, 'nope');
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Rejected.Decision);
+  Assert.AreEqual('invalid_token', Rejected.Challenge.Error);
+
+  const OtherAudienceClaims = Format('{"sub":"u","aud":"https://other","exp":%d}', [Future]);
+  const WrongAudience: IMCPAuthorizer = TClaimsAuthorizer.Create(Audience, OtherAudienceClaims);
+  var ForAnother := Decide(WrongAudience, 'valid');
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, ForAnother.Decision);
+  Assert.IsTrue(ForAnother.Challenge.ErrorDescription.Contains('not issued for this server'),
+    ForAnother.Challenge.ErrorDescription);
+
+  const ExpiredClaims = Format(ClaimsWithExpiryFormat, [Audience, Past]);
+  const Expired: IMCPAuthorizer = TClaimsAuthorizer.Create(Audience, ExpiredClaims);
+  var Stale := Decide(Expired, 'valid');
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Stale.Decision);
+  Assert.IsTrue(Stale.Challenge.ErrorDescription.Contains('expired'), Stale.Challenge.ErrorDescription);
+
+  const NoExpiryClaims = Format('{"sub":"u","aud":"%s"}', [Audience]);
+  const NoExpiry: IMCPAuthorizer = TClaimsAuthorizer.Create(Audience, NoExpiryClaims);
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Decide(NoExpiry, 'valid').Decision, 'exp is mandatory');
+
+  const ScopedClaims = Format('{"sub":"u","aud":"%s","exp":%d,"scope":"read"}', [Audience, Future]);
+  const Scoped = TClaimsAuthorizer.Create(Audience, ScopedClaims);
+  var ScopedRef: IMCPAuthorizer := Scoped;
+  Scoped.RequiredScopes := ['read', 'write'];
+  var Denied := Decide(ScopedRef, 'valid');
+  Assert.AreEqual(TMCPAuthDecision.Forbidden, Denied.Decision);
+  Assert.AreEqual('insufficient_scope', Denied.Challenge.Error);
+  Assert.AreEqual('read write', Denied.Challenge.Scope);
+
+  Scoped.RequiredScopes := ['read'];
+  var Allowed := Decide(ScopedRef, 'valid');
+  Assert.AreEqual(TMCPAuthDecision.Allow, Allowed.Decision);
+  Assert.AreEqual('u', Allowed.Principal.Subject);
+  Assert.IsTrue(Allowed.Principal.HasScope('read'));
+  Assert.IsFalse(Allowed.Principal.HasScope('write'));
+end;
+
+procedure TAuthorizationTests.OAuth_AcceptsAudienceArray_AndScopeArray;
+begin
+  var Future := System.DateUtils.DateTimeToUnix(Now, False) + 600;
+  const UpperAudience = Audience.ToUpper;
+  const ArrayClaims = Format('{"sub":"u","aud":["https://other","%s"],"exp":%d,"scp":["a","b"]}', [UpperAudience, Future]);
+  const Authorizer: IMCPAuthorizer = TClaimsAuthorizer.Create(Audience, ArrayClaims);
+  var Outcome := Decide(Authorizer, 'valid');
+  Assert.AreEqual(TMCPAuthDecision.Allow, Outcome.Decision);
+  Assert.IsTrue(Outcome.Principal.HasScope('a'));
+  Assert.IsTrue(Outcome.Principal.HasScope('b'));
+  Assert.IsFalse(Outcome.Principal.HasScope('c'));
+end;
+
+procedure TAuthorizationTests.OAuth_NeedsAnAudience;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TClaimsAuthorizer.Create(' ', '{}').Free;
+    end, EMCPAuthorizationConfiguration);
+end;
+
+procedure TAuthorizationTests.Challenge_Build_QuotesParameters;
+begin
+  Assert.AreEqual('Bearer', TMCPBearerChallenge.Build('', TMCPAuthChallenge.None));
+  Assert.AreEqual('Bearer resource_metadata="https://s/.well-known/oauth-protected-resource/mcp"',
+    TMCPBearerChallenge.Build('https://s/.well-known/oauth-protected-resource/mcp', TMCPAuthChallenge.None));
+  Assert.AreEqual('Bearer error="invalid_token", error_description="say \"hi\""',
+    TMCPBearerChallenge.Build('', TMCPAuthChallenge.InvalidToken('say "hi"')));
+  Assert.AreEqual('Bearer resource_metadata="https://s/m", error="insufficient_scope", scope="read write"',
+    TMCPBearerChallenge.Build('https://s/m', TMCPAuthChallenge.InsufficientScope('read write')));
+  Assert.IsFalse(TMCPBearerChallenge.Build('', TMCPAuthChallenge.InvalidRequest('a'#13#10'b')).Contains(#10));
+end;
+
+procedure TAuthorizationTests.Metadata_Build_DropsOfflineAccess;
+begin
+  var Metadata := TMCPProtectedResourceMetadata.Build('https://mcp.example/mcp', 'demo',
+    ['https://auth.example'], ['read', 'offline_access', 'write']);
+  try
+    Assert.AreEqual('https://mcp.example/mcp', Metadata.GetValue<string>('resource'));
+    Assert.AreEqual('https://auth.example', Metadata.GetValue<string>('authorization_servers[0]'));
+    Assert.AreEqual(2, (Metadata.GetValue('scopes_supported') as TJSONArray).Count);
+    Assert.AreEqual('header', Metadata.GetValue<string>('bearer_methods_supported[0]'));
+    Assert.AreEqual('demo', Metadata.GetValue<string>('resource_name'));
+  finally
+    Metadata.Free;
+  end;
+
+  var Bare := TMCPProtectedResourceMetadata.Build('https://mcp.example/mcp', '', nil, nil);
+  try
+    Assert.AreEqual(0, (Bare.GetValue('authorization_servers') as TJSONArray).Count);
+    Assert.IsNull(Bare.GetValue('scopes_supported'));
+    Assert.IsNull(Bare.GetValue('resource_name'));
+  finally
+    Bare.Free;
+  end;
+end;
+
+procedure TAuthorizationTests.Metadata_UrlFor_InsertsWellKnownBeforeResourcePath(const ResourceUri: string;
+                                                                                const Expected: string);
+begin
+  const Actual = TMCPProtectedResourceMetadata.UrlFor(ResourceUri);
+
+  Assert.AreEqual(Expected, Actual);
+end;
+
+procedure TAuthorizationTests.Metadata_PathFor_InsertsWellKnownBeforeResourcePath(const ResourceUri: string;
+                                                                                 const Expected: string);
+begin
+  const Actual = TMCPProtectedResourceMetadata.PathFor(ResourceUri);
+
+  Assert.AreEqual(Expected, Actual);
+end;
+
+procedure TAuthorizationTests.HandleIntrospection(Context: TIdContext; Request: TIdHTTPRequestInfo;
+  Response: TIdHTTPResponseInfo);
+begin
+  FSeenAuthorization := Request.RawHeaders.Values['Authorization'];
+  FSeenBody := Request.FormParams;
+  Response.ContentType := 'application/json';
+  const Expiry = System.DateUtils.DateTimeToUnix(Now, False) + 600;
+  if FSeenBody.Contains('token=good') then
+    Response.ContentText := Format('{"active":true,"sub":"alice","aud":"%s","exp":%d,"scope":"read"}', [Audience, Expiry])
+  else
+    Response.ContentText := '{"active":false}';
+end;
+
+procedure TAuthorizationTests.StartIntrospectionServer;
+begin
+  FIntrospection := TIdHTTPServer.Create(nil);
+  const Binding = FIntrospection.Bindings.Add;
+  Binding.IP := '127.0.0.1';
+  Binding.Port := 0;
+  FIntrospection.OnCommandGet := HandleIntrospection;
+  FIntrospection.Active := True;
+end;
+
+function TAuthorizationTests.IntrospectionUrl: string;
+begin
+  const Binding = FIntrospection.Bindings[0];
+  Result := Format('http://127.0.0.1:%d/introspect', [Binding.Port]);
+end;
+
+procedure TAuthorizationTests.Introspection_PostsTokenWithClientCredentials;
+begin
+  StartIntrospectionServer;
+  const Url = IntrospectionUrl;
+
+  const Authorizer: IMCPAuthorizer = TMCPIntrospectionAuthorizer.Create(Audience, Url, IntrospectionClientId, 's3cret');
+  const Active = Decide(Authorizer, ActiveToken);
+  Assert.AreEqual(TMCPAuthDecision.Allow, Active.Decision);
+  Assert.AreEqual('alice', Active.Principal.Subject);
+  Assert.IsTrue(Active.Principal.HasScope('read'));
+  Assert.AreEqual('token=good', FSeenBody);
+  Assert.IsTrue(FSeenAuthorization.StartsWith('Basic '), FSeenAuthorization);
+
+  var Stale := Decide(Authorizer, 'stale');
+  Assert.AreEqual(TMCPAuthDecision.Unauthorized, Stale.Decision);
+  Assert.AreEqual('invalid_token', Stale.Challenge.Error);
+end;
+
+procedure TAuthorizationTests.Introspection_LongClientSecret_SendsBasicHeaderOnOneLine;
+begin
+  FSeenAuthorization := '';
+  StartIntrospectionServer;
+  const Url = IntrospectionUrl;
+  const LongSecret = StringOfChar('x', LongSecretLength);
+  const Authorizer: IMCPAuthorizer = TMCPIntrospectionAuthorizer.Create(Audience, Url, IntrospectionClientId, LongSecret);
+
+  const Active = Decide(Authorizer, ActiveToken);
+
+  Assert.AreEqual(LongSecretAuthorization, FSeenAuthorization, False);
+  Assert.AreEqual(TMCPAuthDecision.Allow, Active.Decision);
+end;
+
+end.
